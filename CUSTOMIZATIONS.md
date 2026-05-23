@@ -161,6 +161,21 @@ ALTER TABLE "Knowledge" ADD COLUMN "enabled" BOOLEAN NOT NULL DEFAULT true;
 
 ---
 
+## 9. AI投稿生成の類似チェック・投稿タイプローテーション
+
+**目的**: 生成される投稿内容が似通うのを抑え、毎回ちがう切り口・場面・感情で下書きを作る
+
+**変更箇所**:
+- `src/lib/generation-diversity.ts` — 投稿タイプ、具体場面、読者感情のローテーション生成、過去投稿のグルーピング、n-gram 類似度チェックを追加
+- `src/app/api/generate/route.ts` — 生成前に直近投稿を取得してプロンプトへ類似回避指示を挿入、生成後に過去投稿・同一バッチ内の類似投稿を保存対象から除外、保存時に `memo` へ生成タイプ情報を記録
+- `src/components/GenerateModal.tsx` — 類似投稿をスキップした場合、生成完了メッセージに件数を表示
+
+**使い方**:
+- 通常どおり「AI生成」を押すだけで、直近投稿との類似回避と投稿タイプのローテーションが自動で効く
+- 生成結果がすべて似すぎている場合は保存せず、別の場面・悩み・結論を追加指示で指定するよう案内する
+
+---
+
 ## 再適用時に Claude がやること
 
 1. スキーマに `enabled` カラムがなければ追加してマイグレーション実行
@@ -180,5 +195,6 @@ ALTER TABLE "Knowledge" ADD COLUMN "enabled" BOOLEAN NOT NULL DEFAULT true;
 15. モバイル用の上部バー・下部ナビ・viewport設定・デスクトップ専用サイドバーがなければ追加
 16. `knowledge/` フォルダ、`knowledge-sync.js`、ナレッジ編集ルールがなければ追加
 17. `src/lib/claude-cli.ts` で公式 `ANTHROPIC_BASE_URL` を安全値として扱っていなければ追加
+18. `src/lib/generation-diversity.ts` と生成APIの類似チェック・投稿タイプローテーションがなければ追加
 
 データ（ナレッジのON/OFF状態・カスタマイズ登録情報）はDB経由で引き継がれるので消えません。

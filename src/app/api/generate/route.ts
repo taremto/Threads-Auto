@@ -2,6 +2,12 @@ import { prisma } from "@/lib/prisma";
 import { NextResponse } from "next/server";
 import { parsePosts } from "@/lib/post-parser";
 import {
+  buildDiversityPlan,
+  buildDiversityPromptSection,
+  filterSimilarPosts,
+  groupHistoricalPosts,
+} from "@/lib/generation-diversity";
+import {
   describeClaudeCliError,
   runClaude,
   type ClaudeCliError,
@@ -64,6 +70,19 @@ export async function POST(request: Request) {
 
     const wantCount = Math.max(1, Math.min(40, Number(count) || 4));
 
+    const historicalRows = await prisma.post.findMany({
+      where: { accountId },
+      orderBy: { createdAt: "desc" },
+      take: 240,
+      select: { groupNo: true, body: true, createdAt: true },
+    });
+    const historicalPosts = groupHistoricalPosts(historicalRows);
+    const diversityPlan = buildDiversityPlan(wantCount, historicalPosts.length);
+    const diversitySection = buildDiversityPromptSection(
+      diversityPlan,
+      historicalPosts
+    );
+
     // プロンプト構築
     const prompt = buildPrompt(
       account.conceptSheet,
@@ -72,6 +91,7 @@ export async function POST(request: Request) {
       customKnowledges.map((k) => k.content),
       postingHours,
       wantCount,
+      diversitySection,
       typeof extraInstructions === "string" ? extraInstructions.trim() : ""
     );
 
@@ -114,6 +134,28 @@ export async function POST(request: Request) {
         { status: 500 }
       );
     }
+    const similarityResult = filterSimilarPosts(
+      posts,
+      diversityPlan,
+      historicalPosts
+    );
+    if (similarityResult.kept.length === 0) {
+      return NextResponse.json(
+        {
+          error:
+            "生成結果が過去投稿と似すぎていたため保存しませんでした。もう一度生成するか、追加指示で別の場面・悩み・結論を指定してください。",
+          skippedSimilar: similarityResult.skipped.length,
+          detail: similarityResult.skipped
+            .slice(0, 3)
+            .map(
+              (item) =>
+                `${item.reason} / 類似度 ${item.score.toFixed(2)} / ${item.matchedExcerpt}`
+            )
+            .join("\n"),
+        },
+        { status: 409 }
+      );
+    }
 
     // 最大groupNoとsortOrderを取得
     const [maxGroup, maxSort] = await Promise.all([
@@ -131,7 +173,8 @@ export async function POST(request: Request) {
     let sortOrder = (maxSort._max.sortOrder ?? 0) + 1;
 
     const dbData = [];
-    for (const post of posts) {
+    for (const { post, plan } of similarityResult.kept) {
+      const memo = `生成タイプ: ${plan.type} / 場面: ${plan.scene} / 感情: ${plan.emotion}`;
       if (post.thread && post.items.length > 1) {
         for (const item of post.items) {
           dbData.push({
@@ -142,6 +185,7 @@ export async function POST(request: Request) {
             charCount: item.length,
             status: "draft",
             batchFile: "ai-generate",
+            memo,
             sortOrder: sortOrder++,
           });
         }
@@ -155,6 +199,7 @@ export async function POST(request: Request) {
           charCount: body.length,
           status: "draft",
           batchFile: "ai-generate",
+          memo,
           sortOrder: sortOrder++,
         });
       }
@@ -164,7 +209,12 @@ export async function POST(request: Request) {
     const result = await prisma.post.createMany({ data: dbData });
 
     return NextResponse.json(
-      { count: result.count, posts: posts.length },
+      {
+        count: result.count,
+        posts: similarityResult.kept.length,
+        requestedPosts: wantCount,
+        skippedSimilar: similarityResult.skipped.length,
+      },
       { status: 201 }
     );
   } catch (e) {
@@ -183,6 +233,7 @@ function buildPrompt(
   customKnowledges: string[],
   postingHours: number[],
   count: number,
+  diversitySection: string,
   extraInstructions: string = ""
 ): string {
   const parts = [
@@ -203,6 +254,8 @@ function buildPrompt(
       ""
     );
   }
+
+  parts.push(diversitySection, "");
 
   if (rules) {
     parts.push("## 投稿生成ルール", rules, "");
