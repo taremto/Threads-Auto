@@ -1,0 +1,1 @@
+ALTER TABLE "Account" ADD COLUMN "scheduleJitterMinutes" INTEGER NOT NULL DEFAULT 15;

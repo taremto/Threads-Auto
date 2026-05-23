@@ -1,0 +1,100 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Account {
+  id              String   @id @default(cuid())
+  name            String
+  threadsUserId   String?
+  threadsUsername  String?
+  accessToken     String?
+  tokenExpiresAt  DateTime?
+
+  // 投稿スケジュール設定
+  postingHours    String   @default("[6,12,18,21]") // JSON配列: 投稿する時間帯
+  postsPerDay     Int      @default(4)              // 1日の投稿数
+  scheduleJitterMinutes Int @default(15)             // 一括予約時に0〜N分だけランダムにずらす
+
+  // コンセプトシート（strategy.md相当）
+  conceptSheet    String?  // アカウント固有のペルソナ・テーマ・キーワード等
+
+  // AI自動生成を有効にするか
+  autoGenerate    Boolean  @default(false)
+
+  // クラウドオフロード（スプシ＋GAS時間トリガーで投稿実行）
+  cloudOffloadEnabled Boolean   @default(false) // ON時はprocessQueueで拾わずGASに任せる
+  gasWebAppUrl        String?                   // GASのWeb App URL
+  gasWebAppKey        String?                   // doPost時の認証キー
+  gasSpreadsheetId    String?                   // 連携先スプシID（参考表示用）
+  lastSyncedAt        DateTime?                 // 最後のpullResults成功時刻
+  tokenFingerprint    String?                   // GAS Properties側トークンの先頭8桁＋末尾4桁
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  posts           Post[]
+  knowledges      Knowledge[]
+}
+
+model Post {
+  id            String   @id @default(cuid())
+  accountId     String
+  account       Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  groupNo       Int
+  body          String
+  postType      String   @default("standalone") // standalone | thread
+  scheduledDate DateTime?
+  scheduledHour Int?
+  scheduledMin  Int?
+  charCount     Int      @default(0)
+  status        String   @default("draft") // draft | queued | posted | error
+  score         Float?
+  threadsPostId String?
+  postedAt      DateTime?
+  postUrl       String?
+  memo          String?
+  error         String?
+  batchFile     String?
+  sortOrder     Int      @default(0)
+  publishAt     DateTime? // キュー時にユーザーが指定する正確な投稿日時
+  retryCount    Int      @default(0) // 投稿失敗時の自動リトライ回数（3回までで打ち切り）
+
+  // 投稿実行の権威（クラウドオフロード対応）
+  // "local": Webのnode-cronが投稿、"gas": GASトリガーが投稿（Web cronはスキップ）
+  executor      String   @default("local")
+  remoteRowId   Int?     // GASシート上の行番号（参考。実検索はpostIdキーで行う）
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([accountId, status])
+  @@index([accountId, scheduledDate])
+  @@index([status, publishAt])
+  @@index([status, executor, publishAt])
+}
+
+model Knowledge {
+  id          String   @id @default(cuid())
+  accountId   String?  // nullなら全アカウント共通
+  account     Account? @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  type        String   // "rules" | "structures" | "custom"
+  title       String   // 表示名（例: "投稿生成ルール", "構成パターン集"）
+  content     String   // ナレッジ本文
+  isDefault   Boolean  @default(false) // システムデフォルトか
+  enabled     Boolean  @default(true) // 生成時に使うかどうか（OFF=スキップ）
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([accountId, type])
+}
+
+model AppSetting {
+  id    String @id @default(cuid())
+  key   String @unique
+  value String
+}
