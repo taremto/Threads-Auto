@@ -1,4 +1,4 @@
-# ぬこ式 Threads 自動投稿 WebUI — Claude Code 用ガイド
+# Threads 自動投稿 WebUI — Claude Code 用ガイド
 
 ## 🛑 最優先で読むこと（誤認禁止）
 

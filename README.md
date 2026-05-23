@@ -1,4 +1,4 @@
-# ぬこ式 Threads自動投稿 WebUI（v1）
+# Threads自動投稿 WebUI（v1）
 
 Threads（Meta）の投稿をAI生成・予約・自動投稿できるWebアプリです。
 ローカルPC上で起動して、ブラウザから操作します。
