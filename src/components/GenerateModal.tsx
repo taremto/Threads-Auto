@@ -118,12 +118,19 @@ export default function GenerateModal({
     );
 
     try {
-      const data = await postJSON<{ count: number }>("/api/generate", {
-        accountId: selectedAccountId,
-        count: postCount,
-        extraInstructions: extraInstructions.trim() || undefined,
-      });
-      setProgress(`${data.count}件の投稿を生成しました`);
+      const data = await postJSON<{ count: number; filtered?: number }>(
+        "/api/generate",
+        {
+          accountId: selectedAccountId,
+          count: postCount,
+          extraInstructions: extraInstructions.trim() || undefined,
+        }
+      );
+      setProgress(
+        data.filtered && data.filtered > 0
+          ? `${data.count}件の投稿を生成しました（似ていた${data.filtered}件を除外）`
+          : `${data.count}件の投稿を生成しました`
+      );
       setTimeout(() => onGenerated(), 1000);
     } catch (e) {
       setError(e instanceof Error ? e.message : "生成に失敗しました");
