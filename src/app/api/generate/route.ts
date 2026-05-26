@@ -1,11 +1,25 @@
 import { prisma } from "@/lib/prisma";
 import { NextResponse } from "next/server";
-import { parsePosts } from "@/lib/post-parser";
+import { parsePosts, type ParsedPost } from "@/lib/post-parser";
 import {
   describeClaudeCliError,
   runClaude,
   type ClaudeCliError,
 } from "@/lib/claude-cli";
+import {
+  fingerprint,
+  isTooSimilar,
+  maxSimilarity,
+  type SimFingerprint,
+} from "@/lib/similarity";
+
+// 似すぎた投稿を弾いた後、不足分を作り直す最大回数（=最大 1+2 回 Claude を呼ぶ）
+const MAX_REGEN_RETRIES = 2;
+// プロンプトに載せる「直近の投稿」の最大件数と、各フックの最大文字数
+const AVOID_HOOK_LIMIT = 25;
+const AVOID_HOOK_MAXLEN = 60;
+// 類似判定の対象にする「直近スレッド」の取得上限
+const RECENT_THREAD_GROUPS = 40;
 
 /**
  * AI投稿生成エンドポイント（Claude Code CLI版 — サブスク範囲内）
@@ -63,22 +77,32 @@ export async function POST(request: Request) {
     }
 
     const wantCount = Math.max(1, Math.min(40, Number(count) || 4));
+    const userExtra =
+      typeof extraInstructions === "string" ? extraInstructions.trim() : "";
 
-    // プロンプト構築
-    const prompt = buildPrompt(
-      account.conceptSheet,
-      rulesKnowledge?.content || "",
-      structuresKnowledge?.content || "",
-      customKnowledges.map((k) => k.content),
-      postingHours,
-      wantCount,
-      typeof extraInstructions === "string" ? extraInstructions.trim() : ""
-    );
+    // 直近の投稿（重複回避用）。プロンプトに「これと被らせない」と渡し、
+    // かつ生成後の類似チェックの参照集合にも使う。
+    const recentThreads = await getRecentThreads(accountId, RECENT_THREAD_GROUPS);
+    const existingFps = recentThreads.map((t) => fingerprint(threadToSim(t)));
 
-    // Claude CLI 実行（サブスク範囲内 / プロンプトは stdin 経由で渡す）
-    let generatedText: string;
+    const callClaude = (avoidThreads: ParsedPost[], n: number, extra: string) =>
+      runClaude(
+        buildPrompt(
+          account.conceptSheet!,
+          rulesKnowledge?.content || "",
+          structuresKnowledge?.content || "",
+          customKnowledges.map((k) => k.content),
+          postingHours,
+          n,
+          extra,
+          buildAvoidHooks(avoidThreads)
+        )
+      );
+
+    // 1回目の生成（ここでのエラーだけはユーザー向けに詳細を返す）
+    let firstText: string;
     try {
-      generatedText = await runClaude(prompt);
+      firstText = await callClaude(recentThreads, wantCount, userExtra);
     } catch (e: unknown) {
       const err = e as ClaudeCliError;
       const rawDetail = `${err.stderr || ""}\n${err.stdout || ""}\n${err.message || ""}`.trim();
@@ -92,7 +116,7 @@ export async function POST(request: Request) {
       );
     }
 
-    if (!generatedText) {
+    if (!firstText) {
       return NextResponse.json(
         {
           error:
@@ -102,18 +126,74 @@ export async function POST(request: Request) {
       );
     }
 
-    // パースしてDBに保存
-    const posts = parsePosts(generatedText, wantCount);
-    if (posts.length === 0) {
+    const allCandidates: ParsedPost[] = parsePosts(firstText, wantCount);
+    if (allCandidates.length === 0) {
       return NextResponse.json(
         {
           error:
             "AIの出力を投稿に分割できませんでした。出力フォーマットが崩れた可能性があります。もう一度「生成開始」を押してみてください。",
-          detail: generatedText.slice(0, 500),
+          detail: firstText.slice(0, 500),
         },
         { status: 500 }
       );
     }
+
+    // 似すぎたものを弾いて、互いに・既存と被らない投稿だけを選ぶ。
+    // 不足分は「これまで採用したもの＋既存」を避けリストに足して作り直す。
+    let { selected, selectedFps } = selectDiverse(
+      allCandidates,
+      existingFps,
+      wantCount
+    );
+
+    for (
+      let attempt = 0;
+      selected.length < wantCount && attempt < MAX_REGEN_RETRIES;
+      attempt++
+    ) {
+      const shortfall = wantCount - selected.length;
+      let moreText: string;
+      try {
+        moreText = await callClaude(
+          [...recentThreads, ...selected],
+          shortfall,
+          regenExtra(userExtra)
+        );
+      } catch (e) {
+        // 作り直しの失敗は致命的にしない（採用済みのぶんは活かす）
+        console.warn("[generate] regen attempt failed:", e);
+        break;
+      }
+      if (!moreText) break;
+      const more = parsePosts(moreText, shortfall);
+      if (more.length === 0) break;
+      allCandidates.push(...more);
+      ({ selected, selectedFps } = selectDiverse(
+        allCandidates,
+        existingFps,
+        wantCount
+      ));
+    }
+
+    // それでも本数が足りなければ、残り候補から「最も似ていない」順に補充して必ず希望数を返す
+    if (selected.length < wantCount) {
+      const chosen = new Set(selected);
+      const refFps = [...existingFps, ...selectedFps];
+      const leftovers = allCandidates
+        .filter((c) => !chosen.has(c))
+        .map((c) => ({
+          post: c,
+          score: maxSimilarity(fingerprint(threadToSim(c)), refFps),
+        }))
+        .sort((a, b) => a.score - b.score);
+      for (const { post } of leftovers) {
+        if (selected.length >= wantCount) break;
+        selected.push(post);
+      }
+    }
+
+    const posts = selected;
+    const filtered = allCandidates.length - posts.length;
 
     // 最大groupNoとsortOrderを取得
     const [maxGroup, maxSort] = await Promise.all([
@@ -164,13 +244,100 @@ export async function POST(request: Request) {
     const result = await prisma.post.createMany({ data: dbData });
 
     return NextResponse.json(
-      { count: result.count, posts: posts.length },
+      { count: result.count, posts: posts.length, filtered },
       { status: 201 }
     );
   } catch (e) {
     console.error("generate error:", e);
     return NextResponse.json({ error: String(e) }, { status: 500 });
   }
+}
+
+// ===========================================================
+// 重複回避ヘルパー
+// ===========================================================
+
+function threadToSim(p: ParsedPost): { hook: string; fullText: string } {
+  return { hook: p.items[0] ?? "", fullText: p.items.join("\n") };
+}
+
+/** 直近の投稿を groupNo 単位でスレッドに復元して新しい順に返す */
+async function getRecentThreads(
+  accountId: string,
+  maxGroups: number
+): Promise<ParsedPost[]> {
+  const rows = await prisma.post.findMany({
+    where: { accountId },
+    orderBy: { createdAt: "desc" },
+    take: 400,
+    select: { groupNo: true, body: true, sortOrder: true },
+  });
+  const byGroup = new Map<number, { body: string; sortOrder: number }[]>();
+  const order: number[] = [];
+  for (const r of rows) {
+    if (!byGroup.has(r.groupNo)) {
+      byGroup.set(r.groupNo, []);
+      order.push(r.groupNo);
+    }
+    byGroup.get(r.groupNo)!.push({ body: r.body, sortOrder: r.sortOrder });
+  }
+  const threads: ParsedPost[] = [];
+  for (const g of order.slice(0, maxGroups)) {
+    const items = byGroup
+      .get(g)!
+      .sort((a, b) => a.sortOrder - b.sortOrder)
+      .map((x) => x.body)
+      .filter((b) => b.trim().length > 0);
+    if (items.length) threads.push({ thread: items.length > 1, items });
+  }
+  return threads;
+}
+
+/** プロンプトに載せる「避けるべき書き出し」の一覧（短く整形） */
+function buildAvoidHooks(threads: ParsedPost[]): string[] {
+  const seen = new Set<string>();
+  const hooks: string[] = [];
+  for (const t of threads) {
+    const raw = (t.items[0] ?? "").replace(/\s+/g, " ").trim();
+    if (!raw) continue;
+    const h =
+      raw.length > AVOID_HOOK_MAXLEN
+        ? raw.slice(0, AVOID_HOOK_MAXLEN) + "…"
+        : raw;
+    if (seen.has(h)) continue;
+    seen.add(h);
+    hooks.push(h);
+    if (hooks.length >= AVOID_HOOK_LIMIT) break;
+  }
+  return hooks;
+}
+
+/** 候補から、既存・互いと被らないスレッドを希望数まで選ぶ */
+function selectDiverse(
+  candidates: ParsedPost[],
+  existingFps: SimFingerprint[],
+  want: number
+): { selected: ParsedPost[]; selectedFps: SimFingerprint[] } {
+  const selected: ParsedPost[] = [];
+  const selectedFps: SimFingerprint[] = [];
+  for (const c of candidates) {
+    if (selected.length >= want) break;
+    const fp = fingerprint(threadToSim(c));
+    const dup =
+      existingFps.some((e) => isTooSimilar(fp, e)) ||
+      selectedFps.some((e) => isTooSimilar(fp, e));
+    if (dup) continue;
+    selected.push(c);
+    selectedFps.push(fp);
+  }
+  return { selected, selectedFps };
+}
+
+/** 作り直し（不足分の再生成）時に足す指示 */
+function regenExtra(userExtra: string): string {
+  const note =
+    "※これは作り直しです。上の「直近で生成済みの投稿」と、書き出し・テーマ・切り口・構成・語尾のリズムが1つも被らない、まったく新しい角度の投稿だけを作ること。同じネタの言い換え・焼き直しは禁止。";
+  return userExtra ? `${userExtra}\n\n${note}` : note;
 }
 
 // ===========================================================
@@ -183,7 +350,8 @@ function buildPrompt(
   customKnowledges: string[],
   postingHours: number[],
   count: number,
-  extraInstructions: string = ""
+  extraInstructions: string = "",
+  recentHooks: string[] = []
 ): string {
   const parts = [
     "あなたはSNSコンテンツの専門家です。以下のコンセプト定義・ルール・構成パターンに基づき、そのまま投稿できる品質のThreads投稿を生成してください。",
@@ -214,6 +382,20 @@ function buildPrompt(
 
   for (const custom of customKnowledges) {
     parts.push("## 追加ナレッジ", custom, "");
+  }
+
+  if (recentHooks.length > 0) {
+    parts.push(
+      "## 🚫 直近で生成済みの投稿（これらと絶対に被らせないこと）",
+      "以下はこのアカウントで最近作った投稿の書き出しです。今回作る投稿は、これらと次のすべてが被らないようにすること：",
+      "- 書き出し・フックの言い回し（同じ入り方をしない）",
+      "- テーマ・話題・切り口（同じネタの焼き直しをしない）",
+      "- 構成パターン・語尾・句読点のリズム",
+      "同じ切り口を別の言葉で言い換えただけ、も「被り」とみなす。下記とかぶる案しか浮かばないなら、別のテーマ・別の構成に切り替えること。",
+      "",
+      ...recentHooks.map((h, i) => `${i + 1}. ${h}`),
+      ""
+    );
   }
 
   parts.push(
