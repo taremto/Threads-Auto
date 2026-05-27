@@ -41,8 +41,8 @@ export default function SettingsPage() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("accounts");
 
   return (
-    <div className="min-w-[720px] flex-1 overflow-visible">
-      <div className="px-8 pt-6 pb-4">
+    <div className="md:min-w-[720px] flex-1 overflow-visible">
+      <div className="px-4 md:px-8 pt-6 pb-4">
         <h2 className="text-xl font-bold text-gray-800">システム設定</h2>
         {/* サブタブ */}
         <div className="flex gap-1 mt-3">
@@ -70,7 +70,7 @@ export default function SettingsPage() {
         </div>
       </div>
 
-      <div className="px-8 pb-8 max-w-7xl">
+      <div className="px-4 md:px-8 pb-8 max-w-7xl">
         {settingsTab === "accounts" && <AccountsSection />}
         {settingsTab === "knowledge" && <KnowledgeSection />}
       </div>

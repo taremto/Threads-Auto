@@ -446,25 +446,26 @@ export default function Dashboard() {
       >
         {(
           [
-            { key: "draft", label: "下書き", page: "posts" },
-            { key: "queued", label: "キュー", page: "posts" },
-            { key: "posted", label: "投稿済み", page: "posts" },
-            { key: "settings", label: "設定", page: "settings" },
+            { key: "draft", label: "下書き", page: "posts", icon: "📝" },
+            { key: "queued", label: "キュー", page: "posts", icon: "🕐" },
+            { key: "posted", label: "投稿済み", page: "posts", icon: "✅" },
+            { key: "overview", label: "概要", page: "overview", icon: "📊" },
+            { key: "settings", label: "設定", page: "settings", icon: "⚙️" },
           ] as const
         ).map((item) => {
           const isActive =
-            item.page === "settings"
-              ? activePage === "settings"
-              : activePage === "posts" && activeTab === item.key;
+            item.page === "posts"
+              ? activePage === "posts" && activeTab === item.key
+              : activePage === item.page;
           return (
             <button
               key={item.key}
               onClick={() => {
-                if (item.page === "settings") {
-                  setActivePage("settings");
-                } else {
+                if (item.page === "posts") {
                   setActivePage("posts");
                   setActiveTab(item.key as Tab);
+                } else {
+                  setActivePage(item.page);
                 }
               }}
               className="flex-1 flex flex-col items-center justify-center py-2 text-[10px] gap-0.5 transition-colors"
@@ -472,9 +473,7 @@ export default function Dashboard() {
                 color: isActive ? "#4fc3f7" : "rgba(255,255,255,0.55)",
               }}
             >
-              <span className="text-lg leading-none">
-                {item.key === "draft" ? "📝" : item.key === "queued" ? "🕐" : item.key === "posted" ? "✅" : "⚙️"}
-              </span>
+              <span className="text-lg leading-none">{item.icon}</span>
               <span>{item.label}</span>
             </button>
           );

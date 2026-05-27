@@ -52,20 +52,20 @@ export default function OverviewPage({ onNavigate }: OverviewPageProps) {
 
   if (loading) {
     return (
-      <div className="min-w-[720px] flex-1 p-8">
+      <div className="md:min-w-[720px] flex-1 p-4 md:p-8">
         <p className="text-gray-400">読み込み中...</p>
       </div>
     );
   }
 
   return (
-    <div className="min-w-[720px] flex-1 overflow-y-auto">
-      <div className="px-8 pt-6 pb-4">
+    <div className="md:min-w-[720px] flex-1 overflow-y-auto">
+      <div className="px-4 md:px-8 pt-6 pb-4">
         <h2 className="text-xl font-bold text-gray-800">全体概要</h2>
       </div>
 
       {/* 全体サマリ */}
-      <div className="px-8 grid grid-cols-4 gap-4 mb-8">
+      <div className="px-4 md:px-8 grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-8">
         <StatCard
           label="下書き"
           value={totals.draft}
@@ -88,7 +88,7 @@ export default function OverviewPage({ onNavigate }: OverviewPageProps) {
       </div>
 
       {/* アカウント別 */}
-      <div className="px-8 pb-8">
+      <div className="px-4 md:px-8 pb-8">
         <h3 className="text-sm font-bold text-gray-600 mb-3">
           アカウント別（{stats.length}件）
         </h3>
