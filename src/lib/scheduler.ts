@@ -17,13 +17,12 @@ const prisma = new PrismaClient();
 const MAX_RETRY = 3;
 const RETRY_DELAY_MIN = 15;
 
-// 予約時刻をこの分数より大きく過ぎた投稿は「投稿せずにスキップ」する。
+// 予約時刻の分を過ぎた投稿は「投稿せずにキューに残す」。
 // 目的: PCがスリープ/電源オフ/アプリ停止していて長時間止まっていた場合に、
 //       復帰直後に「溜まっていた過去の予約」を遅れて投稿してしまう事故を防ぐ。
-// （正常運用ではcronが1分以内に拾うのでこの閾値には絶対に当たらない。
-//   アプリを15分以内に再起動した場合などはまだ拾う。）
+// （10:00予約は10:00台だけ許可。10:01以降は投稿せず、ユーザーに時刻変更してもらう。）
 // クラウドオフロード（executor="gas"）は対象外（GAS側は時間トリガーなのでそもそも遅延しない）。
-const STALE_SKIP_THRESHOLD_MIN = 15;
+const PAST_DUE_GRACE_MIN = 1;
 
 let isRunning = false;
 
@@ -67,27 +66,27 @@ export async function processQueue() {
       ],
     });
 
-    // 予約時刻を大きく過ぎた投稿は投稿せずにスキップ（PCスリープ/停止からの復帰時の遅延投稿事故を防ぐ）
+    // 予約時刻の分を過ぎた投稿は投稿しない（PCスリープ/停止からの復帰時の遅延投稿事故を防ぐ）
     const staleThreshold = new Date(
-      now.getTime() - STALE_SKIP_THRESHOLD_MIN * 60 * 1000
+      now.getTime() - PAST_DUE_GRACE_MIN * 60 * 1000
     );
     const stalePosts = duePosts.filter(
-      (p) => p.publishAt !== null && p.publishAt < staleThreshold
+      (p) => p.publishAt !== null && p.publishAt <= staleThreshold
     );
     const freshPosts = duePosts.filter(
-      (p) => !(p.publishAt !== null && p.publishAt < staleThreshold)
+      (p) => !(p.publishAt !== null && p.publishAt <= staleThreshold)
     );
     if (stalePosts.length > 0) {
       const staleIds = stalePosts.map((p) => p.id);
       await prisma.post.updateMany({
         where: { id: { in: staleIds } },
         data: {
-          status: "error",
-          error: `予約時刻を${STALE_SKIP_THRESHOLD_MIN}分以上過ぎたため投稿をスキップしました（PCがスリープ／停止していた可能性があります）。必要なら下書きに戻して再予約してください。`,
+          error:
+            "予約時刻を過ぎたため自動投稿を止めています。必要ならキュー画面の「時刻変更」で新しい日時に変更してください。",
         },
       });
       console.warn(
-        `[scheduler] ${stalePosts.length}件の投稿を「予約時刻を大きく過ぎたためスキップ」として error 確定（PCスリープ/停止からの復帰と推定）`
+        `[scheduler] ${stalePosts.length}件の投稿を「予約時刻を過ぎたためスキップ」としてキューに残しました`
       );
     }
 

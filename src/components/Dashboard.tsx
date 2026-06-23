@@ -1,23 +1,29 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Sidebar from "./Sidebar";
 import PostCard from "./PostCard";
 import AddAccountModal from "./AddAccountModal";
 import OverviewPage from "./OverviewPage";
+import AnalyticsPage from "./AnalyticsPage";
+import CompetitorAnalysisPage from "./CompetitorAnalysisPage";
 import SettingsPage from "./SettingsPage";
 import GenerateModal from "./GenerateModal";
 
-type Tab = "draft" | "queued" | "posted";
-type Page = "posts" | "overview" | "settings";
+type Tab = "draft" | "queued" | "posted" | "error";
+type Page = "posts" | "overview" | "analytics" | "competitor" | "settings";
 
 type Post = {
   id: string;
   groupNo: number;
+  sortOrder: number;
   body: string;
   postType: string;
   charCount: number;
   score: number | null;
+  recommendedHour: number | null;
+  recommendedLabel: string | null;
+  recommendedReason: string | null;
   scheduledDate: string | null;
   scheduledHour: number | null;
   scheduledMin: number | null;
@@ -25,18 +31,21 @@ type Post = {
   status: string;
   error: string | null;
   createdAt: string;
+  media?: { id: string; publicUrl: string; sortOrder: number; status: string }[];
 };
 
 const statusMap: Record<Tab, string> = {
   draft: "draft",
   queued: "queued",
   posted: "posted",
+  error: "error",
 };
 
 const tabLabel: Record<Tab, string> = {
   draft: "下書き",
   queued: "キュー",
   posted: "投稿済み",
+  error: "エラー",
 };
 
 type AccountLite = { id: string; name: string; cloudOffloadEnabled: boolean };
@@ -47,33 +56,63 @@ export default function Dashboard() {
   const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
   const [accounts, setAccounts] = useState<AccountLite[]>([]);
   const [posts, setPosts] = useState<Post[]>([]);
+  const [loading, setLoading] = useState(false);
   const [showAddAccount, setShowAddAccount] = useState(false);
   const [showGenerate, setShowGenerate] = useState(false);
   const [accountVersion, setAccountVersion] = useState(0);
   const [hasAccounts, setHasAccounts] = useState<boolean | null>(null);
-  const [customizationWarning, setCustomizationWarning] = useState(false);
+  const postsRequestSeq = useRef(0);
 
   const activeAccount = accounts.find((a) => a.id === activeAccountId) || null;
 
-  const fetchPosts = useCallback(() => {
-    if (!activeAccountId) {
-      queueMicrotask(() => setPosts([]));
+  const clearPostList = useCallback(() => {
+    postsRequestSeq.current++;
+    setPosts([]);
+  }, []);
+
+  const fetchPosts = useCallback(async (options?: { accountId?: string; tab?: Tab }) => {
+    const accountId = options?.accountId ?? activeAccountId;
+    const tab = options?.tab ?? activeTab;
+    const requestSeq = ++postsRequestSeq.current;
+
+    if (!accountId) {
+      queueMicrotask(() => {
+        if (requestSeq === postsRequestSeq.current) setPosts([]);
+      });
       return;
     }
-    fetch(
-      `/api/posts?accountId=${activeAccountId}&status=${statusMap[activeTab]}`
-    )
-      .then((r) => {
-        if (!r.ok) return [];
-        return r.json();
-      })
-      .then(setPosts)
-      .catch(() => setPosts([]));
+
+    if (requestSeq === postsRequestSeq.current) setLoading(true);
+    try {
+      const params = new URLSearchParams({
+        accountId,
+        status: statusMap[tab],
+        t: String(Date.now()),
+      });
+      const r = await fetch(`/api/posts?${params.toString()}`, {
+        cache: "no-store",
+      });
+      const nextPosts = r.ok ? await r.json() : [];
+      if (requestSeq === postsRequestSeq.current) setPosts(nextPosts);
+    } catch {
+      if (requestSeq === postsRequestSeq.current) setPosts([]);
+    } finally {
+      if (requestSeq === postsRequestSeq.current) setLoading(false);
+    }
   }, [activeAccountId, activeTab]);
 
   useEffect(() => {
-    if (activePage === "posts") fetchPosts();
-  }, [fetchPosts, activePage]);
+    if (activePage !== "posts") return;
+    const initialId = window.setTimeout(() => fetchPosts(), 0);
+    const intervalMs = activeTab === "draft" ? 60_000 : 15_000;
+    const id = window.setInterval(() => {
+      if (document.visibilityState === "visible") fetchPosts();
+    }, intervalMs);
+    return () => {
+      window.clearTimeout(initialId);
+      window.clearInterval(id);
+    };
+  }, [fetchPosts, activePage, activeTab]);
 
   useEffect(() => {
     fetch("/api/accounts")
@@ -124,21 +163,6 @@ export default function Dashboard() {
     };
   }, [refetchAccountsLite, fetchPosts, activePage]);
 
-  // カスタマイズ適用チェック（バージョンアップ後に未適用なら警告）
-  useEffect(() => {
-    fetch("/api/customizations")
-      .then((r) => {
-        if (!r.ok) return null;
-        return r.json();
-      })
-      .then((data) => {
-        if (data && data.needsReapply) {
-          setCustomizationWarning(true);
-        }
-      })
-      .catch(() => {});
-  }, []);
-
   async function queuePost(postId: string, publishAt: string) {
     try {
       const res = await fetch("/api/posts/group-action", {
@@ -156,20 +180,90 @@ export default function Dashboard() {
       }
       // 成功 → キュータブに切り替えて、ちゃんと入ったのを見せる
       setActiveTab("queued");
-      fetchPosts();
+      fetchPosts({ tab: "queued" });
     } catch (e) {
       alert(`キューに追加できませんでした。\n${String(e)}\n\nもう一度お試しください。`);
       fetchPosts();
     }
   }
 
+  async function reschedulePost(postId: string, publishAt: string) {
+    try {
+      const res = await fetch("/api/posts/group-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ postId, action: "reschedule", publishAt }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.error) {
+        alert(
+          `予約時刻を変更できませんでした。\n${data?.error || `エラー (HTTP ${res.status})`}\n\nもう一度お試しください。`
+        );
+        fetchPosts();
+        return;
+      }
+      fetchPosts();
+    } catch (e) {
+      alert(`予約時刻を変更できませんでした。\n${String(e)}\n\nもう一度お試しください。`);
+      fetchPosts();
+    }
+  }
+
   async function updatePostStatus(postId: string, status: string) {
-    await fetch("/api/posts/group-action", {
+    const res = await fetch("/api/posts/group-action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ postId, action: "status", status }),
     });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data?.error) {
+      alert(`変更できませんでした。\n${data?.error || `エラー (HTTP ${res.status})`}`);
+    }
     fetchPosts();
+  }
+
+  async function retryFailedPost(postId: string) {
+    try {
+      const res = await fetch("/api/posts/group-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ postId, action: "retryFailed" }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.error) {
+        alert(
+          `再試行の予約ができませんでした。\n${data?.error || `エラー (HTTP ${res.status})`}\n\n原因が分からない場合は、自動投稿チェックのサポート用レポートを送ってください。`
+        );
+        fetchPosts();
+        return;
+      }
+      setActiveTab("queued");
+      fetchPosts({ tab: "queued" });
+    } catch (e) {
+      alert(`再試行の予約ができませんでした。\n${String(e)}`);
+      fetchPosts();
+    }
+  }
+
+  async function failedToDraft(postId: string) {
+    try {
+      const res = await fetch("/api/posts/group-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ postId, action: "failedToDraft" }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.error) {
+        alert(`下書きに戻せませんでした。\n${data?.error || `エラー (HTTP ${res.status})`}`);
+        fetchPosts();
+        return;
+      }
+      setActiveTab("draft");
+      fetchPosts({ tab: "draft" });
+    } catch (e) {
+      alert(`下書きに戻せませんでした。\n${String(e)}`);
+      fetchPosts();
+    }
   }
 
   async function deletePost(postId: string) {
@@ -188,6 +282,28 @@ export default function Dashboard() {
       body: JSON.stringify({ postId, action: "edit", body }),
     });
     fetchPosts();
+  }
+
+  // ツリーをAIで拡張（下書きのみ）。append=続き1投稿追加 / rewrite=全文リライトで+1
+  async function extendThread(
+    postId: string,
+    mode: "append" | "rewrite" = "append"
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch("/api/posts/extend-thread", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ postId, mode }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && !data?.error) {
+        fetchPosts();
+        return { ok: true };
+      }
+      return { ok: false, error: data?.error || `エラー (HTTP ${res.status})` };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
   }
 
   async function bulkQueueAll() {
@@ -216,8 +332,15 @@ export default function Dashboard() {
     };
     const list = preview.assignments
       .map(
-        (a: { groupNo: number; publishAt: string; preview: string }) =>
-          `  ${fmt(a.publishAt)}  #${a.groupNo}  ${a.preview}…`
+        (a: {
+          groupNo: number;
+          publishAt: string;
+          preview: string;
+          recommendedLabel?: string | null;
+        }) =>
+          `  ${fmt(a.publishAt)}  #${a.groupNo}  ${a.preview}…${
+            a.recommendedLabel ? `（推奨: ${a.recommendedLabel}）` : ""
+          }`
       )
       .join("\n");
 
@@ -237,7 +360,7 @@ export default function Dashboard() {
       return;
     }
     setActiveTab("queued");
-    fetchPosts();
+    fetchPosts({ tab: "queued" });
   }
 
   function handleAccountCreated(accountId: string) {
@@ -288,198 +411,168 @@ export default function Dashboard() {
   }
 
   return (
-    <div className="flex h-screen md:overflow-x-auto">
-      {/* デスクトップ: 左サイドバー */}
+    <div className="flex h-screen overflow-x-auto">
       <Sidebar
         activePage={activePage}
         onPageChange={setActivePage}
         activeTab={activeTab}
-        onTabChange={setActiveTab}
+        onTabChange={(tab) => {
+          clearPostList();
+          setActiveTab(tab);
+          // 投稿ステータスのタブ（下書き/キュー/投稿済み/エラー）を押したら
+          // 分析や競合分析などのページに居ても投稿一覧へ戻す
+          setActivePage("posts");
+        }}
         activeAccountId={activeAccountId}
-        onAccountChange={setActiveAccountId}
+        onAccountChange={(accountId) => {
+          clearPostList();
+          setActiveAccountId(accountId);
+        }}
         onAddAccount={() => setShowAddAccount(true)}
         accountVersion={accountVersion}
       />
 
-      {/* カスタマイズ未適用警告バナー */}
-      {customizationWarning && (
-        <div className="fixed top-0 left-0 right-0 z-50 bg-orange-50 border-b border-orange-300 px-4 py-3 flex items-center justify-between shadow-sm">
-          <p className="text-xs text-orange-700 leading-snug">
-            <span className="font-bold">カスタマイズの再適用が必要です。</span>{" "}
-            バージョンアップで独自機能が外れています。Claudeに「カスタマイズを再適用して」と伝えてください。
-          </p>
-          <button
-            onClick={() => setCustomizationWarning(false)}
-            className="text-orange-400 hover:text-orange-600 text-lg ml-3 shrink-0"
-          >
-            ✕
-          </button>
-        </div>
+      {activePage === "overview" && (
+        <OverviewPage
+          onNavigate={(accountId, tab) => {
+            clearPostList();
+            setActiveAccountId(accountId);
+            setActiveTab(tab);
+            setActivePage("posts");
+          }}
+        />
       )}
-
-      {/* メインコンテンツ */}
-      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        {/* モバイル: 上部バー（デスクトップでは非表示） */}
-        <div className="md:hidden flex items-center justify-between px-4 pt-3 pb-2 border-b border-gray-200 bg-white shrink-0">
-          <h1 className="text-base font-bold text-gray-800">Threads Auto</h1>
-          {accounts.length > 1 ? (
-            <select
-              value={activeAccountId || ""}
-              onChange={(e) => {
-                setActiveAccountId(e.target.value);
-                setActivePage("posts");
-              }}
-              className="text-xs border border-gray-200 rounded-lg px-2 py-1 max-w-[160px] truncate"
-            >
-              {accounts.map((a) => (
-                <option key={a.id} value={a.id}>{a.name}</option>
-              ))}
-            </select>
-          ) : (
-            <span className="text-xs text-gray-500">{accounts[0]?.name}</span>
-          )}
-        </div>
-
-        {/* ページ本体 */}
-        <div className="flex-1 overflow-y-auto pb-16 md:pb-0">
-          {activePage === "overview" && (
-            <OverviewPage
-              onNavigate={(accountId, tab) => {
-                setActiveAccountId(accountId);
-                setActiveTab(tab);
-                setActivePage("posts");
-              }}
-            />
-          )}
-          {activePage === "settings" && <SettingsPage />}
-          {activePage === "posts" && (
-            <main className="flex-1">
-              {/* Top bar */}
-              <div className="flex flex-wrap items-center justify-between px-4 md:px-8 pt-4 md:pt-6 pb-3 md:pb-4 gap-2">
-                <div>
-                  <h2 className="text-lg md:text-xl font-bold text-gray-800">
-                    {tabLabel[activeTab]} ({posts.length})
-                  </h2>
-                  {activeAccount && (
-                    <p className="text-xs text-gray-400 mt-0.5">
-                      <span className="font-medium text-gray-500 hidden md:inline">
-                        アカウント: {activeAccount.name}
-                      </span>
-                      {activeAccount.cloudOffloadEnabled && (
-                        <span className="text-green-600 md:ml-2">☁ クラウドON</span>
-                      )}
-                    </p>
+      {activePage === "analytics" && (
+        <AnalyticsPage
+          accountId={activeAccountId}
+          accounts={accounts}
+          onAccountChange={(id) => setActiveAccountId(id)}
+        />
+      )}
+      {activePage === "competitor" && (
+        <CompetitorAnalysisPage accounts={accounts} />
+      )}
+      {activePage === "settings" && <SettingsPage />}
+      {activePage === "posts" && (
+        <main className="min-w-[640px] flex-1 overflow-y-auto">
+          {/* Top bar */}
+          <div className="flex items-center justify-between px-8 pt-6 pb-4">
+            <div>
+              <h2 className="text-xl font-bold text-gray-800">
+                {tabLabel[activeTab]} ({posts.length})
+              </h2>
+              {activeAccount && (
+                <p className="text-xs text-gray-400 mt-0.5">
+                  アカウント: <span className="font-medium text-gray-500">{activeAccount.name}</span>
+                  {activeAccount.cloudOffloadEnabled && (
+                    <span className="ml-2 text-green-600">☁ クラウドオフロードON</span>
                   )}
+                </p>
+              )}
+            </div>
+            <div className="flex items-center gap-3">
+              {activeTab === "draft" && posts.length > 0 && (
+                <button
+                  onClick={bulkQueueAll}
+                  className="px-5 py-2 rounded-lg text-sm font-medium text-white transition-opacity hover:opacity-80"
+                  style={{ background: "#ff9800" }}
+                  title="下書き全件を投稿時間帯に沿って自動でキューに追加"
+                >
+                  全件キューに追加
+                </button>
+              )}
+              {activeTab === "draft" && (
+                <button
+                  onClick={() => setShowGenerate(true)}
+                  className="px-5 py-2 rounded-lg text-sm font-medium text-white"
+                  style={{ background: "var(--accent)" }}
+                >
+                  AI生成
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Posts */}
+          <div className="px-8 pb-8">
+            {activeTab === "queued" &&
+              posts.length > 0 &&
+              activeAccount &&
+              !activeAccount.cloudOffloadEnabled && (
+                <div className="mb-4 px-4 py-3 rounded-lg bg-amber-50 border border-amber-200 text-sm text-amber-800 leading-relaxed">
+                  ⚠️ <b>このPCがスリープ／電源オフの間は、予約時刻になっても投稿されません。</b>
+                  キューの投稿はこのアプリ（PC）が起動している時だけ実行されます。
+                  PCを閉じていても投稿させたい場合は「設定 → アカウント編集 → ☁ クラウドオフロード」をセットアップしてください。
                 </div>
-                <div className="flex items-center gap-2">
-                  {activeTab === "draft" && posts.length > 0 && (
-                    <button
-                      onClick={bulkQueueAll}
-                      className="px-3 md:px-5 py-2 rounded-lg text-xs md:text-sm font-medium text-white transition-opacity hover:opacity-80"
-                      style={{ background: "#ff9800" }}
-                      title="下書き全件を投稿時間帯に沿って自動でキューに追加"
-                    >
-                      全件キュー追加
-                    </button>
-                  )}
-                  <button
-                    onClick={() => setShowGenerate(true)}
-                    className="px-3 md:px-5 py-2 rounded-lg text-xs md:text-sm font-medium text-white"
-                    style={{ background: "var(--accent)" }}
-                  >
-                    AI生成
-                  </button>
-                </div>
+              )}
+            {activeAccountId && loading && posts.length === 0 && (
+              <div className="flex flex-col items-center justify-center py-20 text-gray-400">
+                <svg
+                  className="animate-spin mb-3"
+                  width="28"
+                  height="28"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                >
+                  <circle
+                    cx="12"
+                    cy="12"
+                    r="10"
+                    stroke="currentColor"
+                    strokeWidth="3"
+                    strokeOpacity="0.2"
+                  />
+                  <path
+                    d="M22 12a10 10 0 0 1-10 10"
+                    stroke="currentColor"
+                    strokeWidth="3"
+                    strokeLinecap="round"
+                  />
+                </svg>
+                <p className="text-sm">読み込み中…</p>
               </div>
-
-              {/* Posts */}
-              <div className="px-4 md:px-8 pb-8">
-                {activeTab === "queued" &&
-                  posts.length > 0 &&
-                  activeAccount &&
-                  !activeAccount.cloudOffloadEnabled && (
-                    <div className="mb-4 px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800 leading-relaxed">
-                      ⚠️ <b>PCスリープ中は投稿されません。</b>
-                      PCを閉じていても投稿させたい場合は「設定 → ☁ クラウドオフロード」をセットアップしてください。
-                    </div>
-                  )}
-                {activeAccountId && posts.length === 0 && (
-                  <div className="text-center py-16 text-gray-400">
-                    <p className="text-base mb-2">
-                      {tabLabel[activeTab]}はまだありません
-                    </p>
-                    {activeTab === "draft" && (
-                      <p className="text-sm">「AI生成」ボタンで投稿を生成してください</p>
-                    )}
-                  </div>
+            )}
+            {activeAccountId && !loading && posts.length === 0 && (
+              <div className="text-center py-20 text-gray-400">
+                <p className="text-lg mb-2">
+                  {tabLabel[activeTab]}はまだありません
+                </p>
+                {activeTab === "draft" && (
+                  <p className="text-sm">
+                    「AI生成」ボタンで投稿を生成するか、Claude
+                    Codeでインポートしてください
+                  </p>
                 )}
-
-                {posts.map((post, i) => {
-                  const isFirstInGroup =
-                    i === 0 || posts[i - 1].groupNo !== post.groupNo;
-                  const groupPosts = posts.filter(
-                    (p) => p.groupNo === post.groupNo
-                  );
-                  return (
-                    <PostCard
-                      key={post.id}
-                      post={post}
-                      showActions={isFirstInGroup}
-                      groupPosts={groupPosts}
-                      onQueue={queuePost}
-                      onBackToDraft={(id) => updatePostStatus(id, "draft")}
-                      onDelete={deletePost}
-                      onEdit={editPost}
-                    />
-                  );
-                })}
               </div>
-            </main>
-          )}
-        </div>
-      </div>
+            )}
 
-      {/* モバイル: 下部ナビゲーションバー */}
-      <nav
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 border-t border-gray-200 flex items-stretch"
-        style={{ background: "var(--sidebar-bg)" }}
-      >
-        {(
-          [
-            { key: "draft", label: "下書き", page: "posts" },
-            { key: "queued", label: "キュー", page: "posts" },
-            { key: "posted", label: "投稿済み", page: "posts" },
-            { key: "settings", label: "設定", page: "settings" },
-          ] as const
-        ).map((item) => {
-          const isActive =
-            item.page === "settings"
-              ? activePage === "settings"
-              : activePage === "posts" && activeTab === item.key;
-          return (
-            <button
-              key={item.key}
-              onClick={() => {
-                if (item.page === "settings") {
-                  setActivePage("settings");
-                } else {
-                  setActivePage("posts");
-                  setActiveTab(item.key as Tab);
-                }
-              }}
-              className="flex-1 flex flex-col items-center justify-center py-2 text-[10px] gap-0.5 transition-colors"
-              style={{
-                color: isActive ? "#4fc3f7" : "rgba(255,255,255,0.55)",
-              }}
-            >
-              <span className="text-lg leading-none">
-                {item.key === "draft" ? "📝" : item.key === "queued" ? "🕐" : item.key === "posted" ? "✅" : "⚙️"}
-              </span>
-              <span>{item.label}</span>
-            </button>
-          );
-        })}
-      </nav>
+            {posts.map((post, i) => {
+              const isFirstInGroup =
+                i === 0 || posts[i - 1].groupNo !== post.groupNo;
+              const groupPosts = posts.filter(
+                (p) => p.groupNo === post.groupNo
+              );
+              return (
+                <PostCard
+                  key={post.id}
+                  post={post}
+                  showActions={isFirstInGroup}
+                  groupPosts={groupPosts}
+                  cloudOffloadEnabled={activeAccount?.cloudOffloadEnabled ?? false}
+                  onQueue={queuePost}
+                  onReschedule={reschedulePost}
+                  onBackToDraft={(id) => updatePostStatus(id, "draft")}
+                  onRetryFailed={retryFailedPost}
+                  onFailedToDraft={failedToDraft}
+                  onDelete={deletePost}
+                  onEdit={editPost}
+                  onExtendThread={extendThread}
+                />
+              );
+            })}
+          </div>
+        </main>
+      )}
 
       {showAddAccount && (
         <AddAccountModal

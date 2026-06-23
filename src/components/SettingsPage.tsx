@@ -1,9 +1,13 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { CONCEPT_SHEET_TEMPLATE } from "@/lib/concept-template";
 import CloudOffloadWizard from "./CloudOffloadWizard";
 import AutoPostingCheckPanel from "./AutoPostingCheckPanel";
+import {
+  dailyPostCountFromPostingHours,
+  normalizeAccountPostingHours,
+} from "@/lib/account-posting";
 
 type Account = {
   id: string;
@@ -41,7 +45,7 @@ export default function SettingsPage() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("accounts");
 
   return (
-    <div className="min-w-[720px] flex-1 overflow-visible">
+    <div className="min-w-[720px] flex-1 overflow-y-auto">
       <div className="px-8 pt-6 pb-4">
         <h2 className="text-xl font-bold text-gray-800">システム設定</h2>
         {/* サブタブ */}
@@ -70,7 +74,11 @@ export default function SettingsPage() {
         </div>
       </div>
 
-      <div className="px-8 pb-8 max-w-7xl">
+      <div
+        className={`px-8 pb-8 ${
+          settingsTab === "knowledge" ? "max-w-7xl" : "max-w-3xl"
+        }`}
+      >
         {settingsTab === "accounts" && <AccountsSection />}
         {settingsTab === "knowledge" && <KnowledgeSection />}
       </div>
@@ -95,23 +103,13 @@ function AccountsSection() {
   });
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
+  const [pruning, setPruning] = useState(false);
   // コンセプトシートAI編集
   const [conceptAiOpen, setConceptAiOpen] = useState(false);
   const [conceptAiInstruction, setConceptAiInstruction] = useState("");
   const [conceptAiProcessing, setConceptAiProcessing] = useState(false);
   const [conceptAiPreview, setConceptAiPreview] = useState<string | null>(null);
   const [conceptAiError, setConceptAiError] = useState("");
-
-  const fetchAccounts = useCallback(() => {
-    fetch("/api/accounts")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((list) => {
-        if (Array.isArray(list)) setAccounts(list);
-      })
-      .catch(() => {
-        /* 通信失敗時は前回の一覧を保持（ポーリング中にチラつかせない） */
-      });
-  }, []);
 
   function resetConceptAi() {
     setConceptAiOpen(false);
@@ -126,7 +124,6 @@ function AccountsSection() {
     setConceptAiProcessing(true);
     setConceptAiError("");
     setConceptAiPreview(null);
-
     try {
       const res = await fetch("/api/accounts/concept-ai-edit", {
         method: "POST",
@@ -152,9 +149,53 @@ function AccountsSection() {
 
   function applyConceptAi() {
     if (!conceptAiPreview) return;
-    setForm({ ...form, conceptSheet: conceptAiPreview });
+    setForm((f) => ({ ...f, conceptSheet: conceptAiPreview }));
     resetConceptAi();
   }
+
+  // 未使用画像の整理（Driveのゴミ掃除）
+  async function handlePruneMedia(accountId: string) {
+    if (pruning) return;
+    if (
+      !window.confirm(
+        "どの投稿にも使われていない画像を、Googleドライブのゴミ箱へ移動します（30日間は復元可）。実行しますか？"
+      )
+    ) {
+      return;
+    }
+    setPruning(true);
+    setMessage("");
+    try {
+      const r = await fetch("/api/cloud/prune-media", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accountId }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.ok) {
+        setMessage(
+          `未使用の画像を${d.trashed}枚整理しました（投稿に使っている${d.kept}枚は残しています）。`
+        );
+      } else {
+        setMessage(d.error || `整理に失敗しました (HTTP ${r.status})`);
+      }
+    } catch (e) {
+      setMessage(`整理に失敗しました: ${String(e)}`);
+    } finally {
+      setPruning(false);
+    }
+  }
+
+  const fetchAccounts = useCallback(() => {
+    fetch("/api/accounts")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((list) => {
+        if (Array.isArray(list)) setAccounts(list);
+      })
+      .catch(() => {
+        /* 通信失敗時は前回の一覧を保持（ポーリング中にチラつかせない） */
+      });
+  }, []);
 
   useEffect(() => {
     fetchAccounts();
@@ -179,7 +220,7 @@ function AccountsSection() {
       name: acc.name,
       accessToken: acc.accessToken ? "********" : "",
       postingHours: acc.postingHours,
-      postsPerDay: acc.postsPerDay,
+      postsPerDay: dailyPostCountFromPostingHours(acc.postingHours),
       scheduleJitterMinutes: acc.scheduleJitterMinutes ?? 15,
       conceptSheet: acc.conceptSheet || "",
       autoGenerate: acc.autoGenerate,
@@ -192,11 +233,12 @@ function AccountsSection() {
     if (!editing) return;
     setSaving(true);
     setMessage("");
+    const postingHours = normalizeAccountPostingHours(form.postingHours);
 
     const data: Record<string, unknown> = {
       name: form.name,
-      postingHours: form.postingHours,
-      postsPerDay: form.postsPerDay,
+      postingHours: JSON.stringify(postingHours),
+      postsPerDay: postingHours.length,
       scheduleJitterMinutes: form.scheduleJitterMinutes,
       conceptSheet: form.conceptSheet || null,
       autoGenerate: form.autoGenerate,
@@ -227,23 +269,28 @@ function AccountsSection() {
 
   // 投稿時間帯のパースと表示
   function parseHours(json: string): number[] {
-    try {
-      return JSON.parse(json);
-    } catch {
-      return [6, 12, 18, 21];
-    }
+    return normalizeAccountPostingHours(json);
   }
 
   function toggleHour(hour: number) {
     const hours = parseHours(form.postingHours);
     const idx = hours.indexOf(hour);
     if (idx >= 0) {
+      if (hours.length <= 1) {
+        setMessage("投稿時間帯は最低1つ必要です");
+        setTimeout(() => setMessage(""), 2000);
+        return;
+      }
       hours.splice(idx, 1);
     } else {
       hours.push(hour);
       hours.sort((a, b) => a - b);
     }
-    setForm({ ...form, postingHours: JSON.stringify(hours) });
+    setForm({
+      ...form,
+      postingHours: JSON.stringify(hours),
+      postsPerDay: hours.length,
+    });
   }
 
   return (
@@ -263,10 +310,9 @@ function AccountsSection() {
             className="bg-white rounded-xl p-5 shadow-sm border border-gray-100"
           >
             {editing === acc.id ? (
-              <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(340px,0.82fr)]">
-                <div className="space-y-4 min-w-0">
-                  {/* 基本設定 */}
-                  <div>
+              <div className="space-y-4">
+                {/* 基本設定 */}
+                <div>
                   <label className="block text-xs font-medium text-gray-500 mb-1">
                     アカウント名
                   </label>
@@ -276,9 +322,9 @@ function AccountsSection() {
                     onChange={(e) => setForm({ ...form, name: e.target.value })}
                     className="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-blue-300"
                   />
-                  </div>
+                </div>
 
-                  <div>
+                <div>
                   <label className="block text-xs font-medium text-gray-500 mb-1">
                     アクセストークン
                   </label>
@@ -291,10 +337,10 @@ function AccountsSection() {
                     placeholder="Threads API のアクセストークン"
                     className="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-blue-300"
                   />
-                  </div>
+                </div>
 
-                  {/* 投稿スケジュール */}
-                  <div>
+                {/* 投稿スケジュール */}
+                <div>
                   <label className="block text-xs font-medium text-gray-500 mb-2">
                     投稿時間帯
                   </label>
@@ -319,28 +365,21 @@ function AccountsSection() {
                       );
                     })}
                   </div>
-                  </div>
+                </div>
 
-                  <div>
+                <div>
                   <label className="block text-xs font-medium text-gray-500 mb-1">
                     1日の投稿数
                   </label>
-                  <select
-                    value={form.postsPerDay}
-                    onChange={(e) =>
-                      setForm({ ...form, postsPerDay: Number(e.target.value) })
-                    }
-                    className="px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-blue-300"
-                  >
-                    {[2, 3, 4, 5, 6, 8].map((n) => (
-                      <option key={n} value={n}>
-                        {n}投稿/日
-                      </option>
-                    ))}
-                  </select>
+                  <div className="inline-flex items-center px-3 py-2 rounded-lg border border-gray-200 bg-gray-50 text-sm text-gray-700">
+                    {parseHours(form.postingHours).length}投稿/日
                   </div>
+                  <p className="mt-1 text-[11px] text-gray-400">
+                    投稿時間帯の数で自動決定します。例: 6時/12時/18時/21時なら4投稿/日です。
+                  </p>
+                </div>
 
-                  <div>
+                <div>
                   <label className="block text-xs font-medium text-gray-500 mb-1">
                     予約時間のランダム幅
                   </label>
@@ -363,10 +402,10 @@ function AccountsSection() {
                   <p className="mt-1 text-[11px] text-gray-400">
                     一括予約時に、選んだ投稿時間から少しだけ後ろへずらします。初期値は0〜15分です。
                   </p>
-                  </div>
+                </div>
 
-                  {/* 自動生成ON/OFF */}
-                  <div className="flex items-center gap-3">
+                {/* 自動生成ON/OFF */}
+                <div className="flex items-center gap-3">
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
                       type="checkbox"
@@ -380,14 +419,32 @@ function AccountsSection() {
                       毎朝5時に自動生成する
                     </span>
                   </label>
+                </div>
+
+                {/* クラウドオフロード（PCを閉じても投稿） */}
+                <CloudOffloadWizard account={acc} onChange={fetchAccounts} />
+
+                {/* 未使用画像の整理（Driveのゴミ掃除） */}
+                {acc.cloudOffloadEnabled && (
+                  <div className="rounded-lg border border-gray-100 bg-gray-50 px-3 py-2.5">
+                    <button
+                      type="button"
+                      onClick={() => handlePruneMedia(acc.id)}
+                      disabled={pruning}
+                      className="text-xs font-medium text-gray-600 hover:text-gray-800 hover:underline disabled:opacity-50"
+                    >
+                      🧹 {pruning ? "整理中…" : "未使用の画像を整理（Driveを掃除）"}
+                    </button>
+                    <p className="mt-1 text-[11px] text-gray-400">
+                      どの投稿にも使っていない画像を、Googleドライブの ThreadsAutoMedia
+                      フォルダからゴミ箱へ移します（30日間は復元可）。投稿に使っている画像は残ります。
+                    </p>
                   </div>
+                )}
 
-                  {/* クラウドオフロード（PCを閉じても投稿） */}
-                  <CloudOffloadWizard account={acc} onChange={fetchAccounts} />
-
-                  {/* コンセプトシート */}
-                  <div>
-                  <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+                {/* コンセプトシート */}
+                <div>
+                  <div className="flex items-center justify-between mb-1">
                     <label className="block text-xs font-medium text-gray-500">
                       コンセプトシート
                     </label>
@@ -396,7 +453,7 @@ function AccountsSection() {
                         type="button"
                         onClick={() => setConceptAiOpen(!conceptAiOpen)}
                         disabled={conceptAiProcessing}
-                        className="text-[11px] font-medium text-purple-600 hover:underline disabled:opacity-50"
+                        className="text-[11px] text-purple-600 hover:underline disabled:opacity-50"
                       >
                         🤖 AIで編集
                       </button>
@@ -419,48 +476,46 @@ function AccountsSection() {
                     </div>
                   </div>
 
-                  {/* AI編集パネル */}
+                  {/* コンセプトAI編集パネル */}
                   {conceptAiOpen && (
-                    <div className="mb-2 p-4 rounded-lg border border-purple-200 bg-purple-50/50">
-                      <div className="flex items-center gap-2 mb-2">
-                        <span className="text-sm font-medium text-purple-700">AIに指示してコンセプトを編集</span>
-                      </div>
+                    <div className="mb-2 p-3 rounded-lg border border-purple-200 bg-purple-50">
+                      <p className="text-xs font-medium text-purple-700 mb-2">
+                        🤖 AIにコンセプトシートを編集してもらう
+                      </p>
                       <textarea
                         value={conceptAiInstruction}
                         onChange={(e) => setConceptAiInstruction(e.target.value)}
                         disabled={conceptAiProcessing}
-                        rows={3}
-                        placeholder={`例:\n・ターゲットを「20代後半の転職迷子」に絞り込んで\n・「UZUZ」の訴求文を3パターン追加して\n・避けたい定型句に「2種類の人間がいる」「断言します」を追加`}
-                        className="w-full px-3 py-2 rounded-lg border border-purple-200 text-sm focus:outline-none focus:border-purple-400 resize-y leading-relaxed bg-white"
+                        rows={2}
+                        placeholder="例: ターゲットを20代後半の女性に絞って書き直して / 避けたい定型表現の項目を追加して"
+                        className="w-full px-3 py-2 rounded-lg border border-purple-300 text-sm focus:outline-none focus:border-purple-500 bg-white disabled:opacity-50"
                       />
                       {conceptAiError && (
-                        <div className="mt-2 p-2 rounded-lg bg-red-50 border border-red-200 text-xs text-red-600 whitespace-pre-wrap">
-                          {conceptAiError}
-                        </div>
+                        <p className="text-xs text-red-600 mt-1">{conceptAiError}</p>
                       )}
                       {conceptAiProcessing && (
-                        <div className="mt-2 p-2 rounded-lg bg-blue-50 border border-blue-200 text-xs text-blue-600">
-                          AIが編集中...（1〜2分かかります）
-                        </div>
+                        <p className="text-xs text-purple-600 mt-2">
+                          AIが編集案を作成中です…（少し時間がかかります）
+                        </p>
                       )}
                       {conceptAiPreview && (
                         <div className="mt-2">
-                          <div className="text-xs font-medium text-purple-600 mb-1">
-                            編集結果プレビュー（適用すると下のテキストエリアに反映されます。アカウント保存はまだ別途必要）:
-                          </div>
-                          <div className="p-3 rounded-lg border border-gray-200 bg-white text-sm text-gray-700 max-h-60 overflow-y-auto whitespace-pre-wrap font-mono leading-relaxed">
+                          <p className="text-xs text-purple-600 mb-1">編集案のプレビュー：</p>
+                          <div className="text-sm whitespace-pre-wrap text-gray-800 bg-white p-3 rounded-lg border border-purple-200 max-h-60 overflow-y-auto leading-relaxed">
                             {conceptAiPreview}
                           </div>
                         </div>
                       )}
-                      <div className="flex flex-wrap gap-2 mt-3">
+                      <div className="flex gap-2 mt-2">
                         {!conceptAiPreview ? (
                           <button
                             type="button"
                             onClick={handleConceptAiGenerate}
-                            disabled={conceptAiProcessing || !conceptAiInstruction.trim()}
-                            className="px-4 py-2 rounded-lg text-sm font-medium text-white disabled:opacity-50"
-                            style={{ background: "var(--accent)" }}
+                            disabled={
+                              conceptAiProcessing || !conceptAiInstruction.trim()
+                            }
+                            className="px-3 py-1.5 rounded-md text-xs font-medium text-white transition-opacity hover:opacity-80 disabled:opacity-40"
+                            style={{ background: "#7b1fa2" }}
                           >
                             {conceptAiProcessing ? "処理中..." : "AIで編集"}
                           </button>
@@ -469,17 +524,20 @@ function AccountsSection() {
                             <button
                               type="button"
                               onClick={applyConceptAi}
-                              className="px-4 py-2 rounded-lg text-sm font-medium text-white"
-                              style={{ background: "var(--accent)" }}
+                              className="px-3 py-1.5 rounded-md text-xs font-medium text-white transition-opacity hover:opacity-80"
+                              style={{ background: "#7b1fa2" }}
                             >
                               この内容を反映
                             </button>
                             <button
                               type="button"
-                              onClick={() => { setConceptAiPreview(null); setConceptAiError(""); }}
-                              className="px-4 py-2 rounded-lg text-sm text-purple-600 hover:bg-purple-100"
+                              onClick={() => {
+                                setConceptAiPreview(null);
+                                setConceptAiError("");
+                              }}
+                              className="px-3 py-1.5 rounded-md text-xs font-medium text-gray-700 bg-gray-200 transition-opacity hover:opacity-80"
                             >
-                              やり直し
+                              やり直す
                             </button>
                           </>
                         )}
@@ -487,14 +545,13 @@ function AccountsSection() {
                           type="button"
                           onClick={resetConceptAi}
                           disabled={conceptAiProcessing}
-                          className="px-4 py-2 rounded-lg text-sm text-gray-500 hover:bg-gray-100"
+                          className="px-3 py-1.5 rounded-md text-xs font-medium text-gray-500 hover:bg-gray-100 disabled:opacity-50"
                         >
                           閉じる
                         </button>
                       </div>
                     </div>
                   )}
-
                   <textarea
                     value={form.conceptSheet}
                     onChange={(e) =>
@@ -507,9 +564,9 @@ function AccountsSection() {
                   <p className="text-[11px] text-gray-400 mt-1">
                     AI生成の精度はこのコンセプトシートの記入精度で決まります。失敗体験・持論・避けたい定型句を埋めるほど刺さるフックが生まれます。
                   </p>
-                  </div>
+                </div>
 
-                  <div className="flex gap-2 pt-1">
+                <div className="flex gap-2 pt-1">
                   <button
                     onClick={handleSave}
                     disabled={saving}
@@ -531,15 +588,7 @@ function AccountsSection() {
                   >
                     削除
                   </button>
-                  </div>
                 </div>
-                <ContentPreviewPanel
-                  title="コンセプト全文"
-                  subtitle={form.name || acc.name}
-                  content={conceptAiPreview || form.conceptSheet}
-                  badge={conceptAiPreview ? "AIプレビュー" : "編集中"}
-                  emptyText="コンセプトシートの内容がここに全文表示されます。"
-                />
               </div>
             ) : (
               <div className="flex items-center justify-between">
@@ -561,7 +610,9 @@ function AccountsSection() {
                         .map((h: number) => `${h}時`)
                         .join("/")}
                     </span>
-                    <span>{acc.postsPerDay}投稿/日</span>
+                    <span>
+                      {dailyPostCountFromPostingHours(acc.postingHours)}投稿/日
+                    </span>
                     {acc.autoGenerate && (
                       <span className="text-blue-500">自動生成ON</span>
                     )}
@@ -604,7 +655,6 @@ function KnowledgeSection() {
   const [filter, setFilter] = useState<string>("all");
   const [editing, setEditing] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-  const [previewKnowledgeId, setPreviewKnowledgeId] = useState<string | null>(null);
   const [form, setForm] = useState({
     title: "",
     type: "custom" as string,
@@ -612,16 +662,69 @@ function KnowledgeSection() {
     accountId: null as string | null,
   });
   const [saving, setSaving] = useState(false);
-  // ドラッグ&ドロップ
-  const [draggingId, setDraggingId] = useState<string | null>(null);
-  const [dragOverId, setDragOverId] = useState<string | null>(null);
-  const dragFromHandle = useRef(false);
   // AI編集
   const [aiEditingId, setAiEditingId] = useState<string | null>(null);
   const [aiInstruction, setAiInstruction] = useState("");
   const [aiProcessing, setAiProcessing] = useState(false);
   const [aiPreview, setAiPreview] = useState<string | null>(null);
   const [aiError, setAiError] = useState("");
+  // 右側の全文プレビューで表示するナレッジ
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  function resetAiEdit() {
+    setAiEditingId(null);
+    setAiInstruction("");
+    setAiProcessing(false);
+    setAiPreview(null);
+    setAiError("");
+  }
+
+  async function handleToggleEnabled(id: string, enabled: boolean) {
+    await fetch("/api/knowledge", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, enabled }),
+    });
+    fetchKnowledges();
+  }
+
+  async function handleAiGenerate() {
+    if (!aiEditingId || !aiInstruction.trim()) return;
+    setAiProcessing(true);
+    setAiError("");
+    setAiPreview(null);
+    try {
+      const res = await fetch("/api/knowledge/ai-edit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          knowledgeId: aiEditingId,
+          instruction: aiInstruction.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAiError(data.error || "AI編集に失敗しました");
+      } else {
+        setAiPreview(data.content);
+      }
+    } catch (e) {
+      setAiError(e instanceof Error ? e.message : "AI編集に失敗しました");
+    } finally {
+      setAiProcessing(false);
+    }
+  }
+
+  async function handleAiApply() {
+    if (!aiEditingId || !aiPreview) return;
+    await fetch("/api/knowledge", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: aiEditingId, content: aiPreview }),
+    });
+    resetAiEdit();
+    fetchKnowledges();
+  }
 
   const fetchKnowledges = useCallback(() => {
     fetch("/api/knowledge?scope=all")
@@ -651,7 +754,6 @@ function KnowledgeSection() {
   function startEdit(k: Knowledge) {
     setEditing(k.id);
     setCreating(false);
-    setPreviewKnowledgeId(k.id);
     setForm({
       title: k.title,
       type: k.type,
@@ -663,7 +765,6 @@ function KnowledgeSection() {
   function startCreate() {
     setCreating(true);
     setEditing(null);
-    setPreviewKnowledgeId(null);
     // フィルタが特定アカウントなら、新規作成時もそのアカウントを初期値に
     const initialAccountId =
       filter !== "all" && filter !== "common" ? filter : null;
@@ -711,200 +812,78 @@ function KnowledgeSection() {
     fetchKnowledges();
   }
 
-  async function handleDrop(targetId: string) {
-    if (!draggingId || draggingId === targetId) {
-      setDraggingId(null);
-      setDragOverId(null);
-      return;
-    }
-    // filtered 配列内で並び替え
-    const ids = filtered.map((k) => k.id);
-    const fromIdx = ids.indexOf(draggingId);
-    const toIdx = ids.indexOf(targetId);
-    if (fromIdx === -1 || toIdx === -1) return;
-
-    const reordered = [...ids];
-    reordered.splice(fromIdx, 1);
-    reordered.splice(toIdx, 0, draggingId);
-
-    // 楽観的UI更新
-    const newOrder = reordered.map((id) => knowledges.find((k) => k.id === id)!);
-    setKnowledges([
-      ...knowledges.filter((k) => !reordered.includes(k.id)),
-      ...newOrder,
-    ]);
-
-    setDraggingId(null);
-    setDragOverId(null);
-
-    // DBに保存
-    await Promise.all(
-      reordered.map((id, idx) =>
-        fetch("/api/knowledge", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id, sortOrder: idx + 1 }),
-        })
-      )
-    );
-    fetchKnowledges();
-  }
-
-  async function handleToggleEnabled(id: string, enabled: boolean) {
-    await fetch("/api/knowledge", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, enabled }),
-    });
-    fetchKnowledges();
-  }
-
-  function startAiEdit(id: string) {
-    setAiEditingId(id);
-    setPreviewKnowledgeId(id);
-    setAiInstruction("");
-    setAiPreview(null);
-    setAiError("");
-  }
-
-  function cancelAiEdit() {
-    setAiEditingId(null);
-    setAiInstruction("");
-    setAiPreview(null);
-    setAiError("");
-    setAiProcessing(false);
-  }
-
-  async function handleAiGenerate() {
-    if (!aiEditingId || !aiInstruction.trim()) return;
-    setAiProcessing(true);
-    setAiError("");
-    setAiPreview(null);
-
-    try {
-      const res = await fetch("/api/knowledge/ai-edit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          knowledgeId: aiEditingId,
-          instruction: aiInstruction.trim(),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setAiError(data.error || "AI編集に失敗しました");
-      } else {
-        setAiPreview(data.content);
-      }
-    } catch (e) {
-      setAiError(e instanceof Error ? e.message : "AI編集に失敗しました");
-    } finally {
-      setAiProcessing(false);
-    }
-  }
-
-  async function handleAiApply() {
-    if (!aiEditingId || !aiPreview) return;
-    setSaving(true);
-    try {
-      await fetch("/api/knowledge", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: aiEditingId, content: aiPreview }),
-      });
-      cancelAiEdit();
-      fetchKnowledges();
-    } catch (e) {
-      setAiError(e instanceof Error ? e.message : "保存に失敗しました");
-    } finally {
-      setSaving(false);
-    }
-  }
-
   const typeLabels: Record<string, string> = {
     rules: "生成ルール",
     structures: "構成パターン",
-    custom: "カスタム",
+    custom: "追加ナレッジ",
   };
 
-  const previewedKnowledge =
-    !creating && !editing
-      ? filtered.find((k) => k.id === previewKnowledgeId) ?? filtered[0]
-      : null;
+  // 右側の全文プレビュー欄に出す内容を決める
+  const selectedKnowledge = knowledges.find((k) => k.id === selectedId) || null;
+  const previewContent =
+    aiPreview ??
+    (creating || editing ? form.content : selectedKnowledge?.content ?? "");
   const previewTitle = creating
     ? form.title || "新規ナレッジ"
     : editing
       ? form.title || "編集中のナレッジ"
-      : previewedKnowledge?.title || "ナレッジ全文";
-  const previewSubtitle = creating
-    ? accountName(form.accountId)
-    : editing
-      ? accountName(form.accountId)
-      : previewedKnowledge
-        ? accountName(previewedKnowledge.accountId)
-        : "選択中のナレッジ";
-  const previewContent =
-    creating || editing
-      ? form.content
-      : aiPreview && aiEditingId === previewedKnowledge?.id
-        ? aiPreview
-        : previewedKnowledge?.content || "";
-  const previewBadge =
-    creating || editing
-      ? "編集中"
-      : aiPreview && aiEditingId === previewedKnowledge?.id
-        ? "AIプレビュー"
-        : previewedKnowledge
-          ? typeLabels[previewedKnowledge.type] || previewedKnowledge.type
+      : selectedKnowledge?.title || "全文プレビュー";
+  const previewBadge = aiPreview
+    ? "AIプレビュー"
+    : creating
+      ? "新規作成中"
+      : editing
+        ? "編集中"
+        : selectedKnowledge
+          ? "選択中"
           : undefined;
 
   return (
-    <section className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(340px,0.82fr)]">
-      <div className="min-w-0">
-        <div className="flex items-start justify-between mb-3 gap-3">
-          <p className="text-sm text-gray-500 flex-1">
-            投稿生成に使うナレッジを管理します。「全アカウント共通」のナレッジは全てのアカウントで使われ、特定アカウントを指定したナレッジはそのアカウントの生成時のみ追加で使われます。
-          </p>
-          <button
-            onClick={startCreate}
-            className="px-4 py-2 rounded-lg text-sm font-medium text-white whitespace-nowrap"
-            style={{ background: "var(--accent)" }}
-          >
-            + ナレッジ追加
-          </button>
-        </div>
+    <section>
+      <div className="flex items-start justify-between mb-3 gap-3">
+        <p className="text-sm text-gray-500 flex-1">
+          投稿生成に使うナレッジを管理します。「全アカウント共通」のナレッジは全てのアカウントで使われ、特定アカウントを指定したナレッジはそのアカウントの生成時のみ追加で使われます。
+        </p>
+        <button
+          onClick={startCreate}
+          className="px-4 py-2 rounded-lg text-sm font-medium text-white whitespace-nowrap"
+          style={{ background: "var(--accent)" }}
+        >
+          + ナレッジ追加
+        </button>
+      </div>
 
-        <div className="mb-4 p-3 rounded-lg bg-gray-50 border border-gray-200 text-xs text-gray-500 leading-relaxed">
-          💡 ここで追加・編集・削除したナレッジは、このアプリ（中の小さなデータベース）に保存されます。
-          ツールに最初から入っている <code>prisma/</code> フォルダ内の <code>.md</code> ファイルは
-          「初回セットアップ用の初期テンプレート」で、ここでの編集では書き換わりません（編集が消えるわけではなく、アプリ側に保存されています）。
-        </div>
+      <div className="mb-4 p-3 rounded-lg bg-gray-50 border border-gray-200 text-xs text-gray-500 leading-relaxed">
+        💡 ここで追加・編集・削除したナレッジは、このアプリ（中の小さなデータベース）に保存されます。
+        ツールに最初から入っている <code>prisma/</code> フォルダ内の <code>.md</code> ファイルは
+        「初回セットアップ用の初期テンプレート」で、ここでの編集では書き換わりません（編集が消えるわけではなく、アプリ側に保存されています）。
+      </div>
 
-        {/* フィルタ */}
-        <div className="flex items-center gap-2 mb-4 flex-wrap">
-          <span className="text-xs text-gray-500">対象:</span>
-          <FilterChip active={filter === "all"} onClick={() => setFilter("all")}>
-            すべて ({knowledges.length})
-          </FilterChip>
-          <FilterChip
-            active={filter === "common"}
-            onClick={() => setFilter("common")}
-          >
-            全アカウント共通 ({knowledges.filter((k) => !k.accountId).length})
-          </FilterChip>
-          {accounts.map((a) => {
-            const count = knowledges.filter((k) => k.accountId === a.id).length;
-            return (
-              <FilterChip
-                key={a.id}
-                active={filter === a.id}
-                onClick={() => setFilter(a.id)}
-              >
-                {a.name} ({count})
-              </FilterChip>
-            );
-          })}
-        </div>
+      {/* フィルタ */}
+      <div className="flex items-center gap-2 mb-4 flex-wrap">
+        <span className="text-xs text-gray-500">対象:</span>
+        <FilterChip active={filter === "all"} onClick={() => setFilter("all")}>
+          すべて ({knowledges.length})
+        </FilterChip>
+        <FilterChip
+          active={filter === "common"}
+          onClick={() => setFilter("common")}
+        >
+          全アカウント共通 ({knowledges.filter((k) => !k.accountId).length})
+        </FilterChip>
+        {accounts.map((a) => {
+          const count = knowledges.filter((k) => k.accountId === a.id).length;
+          return (
+            <FilterChip
+              key={a.id}
+              active={filter === a.id}
+              onClick={() => setFilter(a.id)}
+            >
+              {a.name} ({count})
+            </FilterChip>
+          );
+        })}
+      </div>
 
       {/* 新規作成フォーム */}
       {creating && (
@@ -920,30 +899,15 @@ function KnowledgeSection() {
         </div>
       )}
 
-      <div className="space-y-3">
+      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(340px,0.82fr)] gap-4 items-start">
+      <div className="space-y-3 min-w-0">
         {filtered.map((k) => (
           <div
             key={k.id}
-            draggable={editing !== k.id && !creating}
-            onClick={() => setPreviewKnowledgeId(k.id)}
-            onDragStart={(e) => {
-              if (!dragFromHandle.current) { e.preventDefault(); return; }
-              dragFromHandle.current = false;
-              setDraggingId(k.id);
-            }}
-            onDragEnd={() => { dragFromHandle.current = false; setDraggingId(null); setDragOverId(null); }}
-            onDragOver={(e) => { e.preventDefault(); setDragOverId(k.id); }}
-            onDragLeave={() => setDragOverId(null)}
-            onDrop={() => handleDrop(k.id)}
-            className={`bg-white rounded-xl p-5 shadow-sm border transition-all cursor-pointer ${
-              dragOverId === k.id && draggingId !== k.id
-                ? "border-blue-400 shadow-md scale-[1.01]"
-                : previewedKnowledge?.id === k.id && !creating && !editing
-                  ? "border-blue-200"
-                  : "border-gray-100"
-            } ${draggingId === k.id ? "opacity-40" : ""} ${
-              k.enabled === false ? "opacity-50" : ""
-            }`}
+            onClick={() => setSelectedId(k.id)}
+            className={`bg-white rounded-xl p-5 shadow-sm border cursor-pointer transition-colors ${
+              selectedId === k.id ? "border-blue-300" : "border-gray-100"
+            } ${k.enabled === false ? "opacity-50" : ""}`}
           >
             {editing === k.id ? (
               <div>
@@ -965,151 +929,140 @@ function KnowledgeSection() {
                 )}
               </div>
             ) : (
-              <div>
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    {/* ドラッグハンドル */}
-                    {editing !== k.id && !creating && (
-                      <span
-                        onMouseDown={() => { dragFromHandle.current = true; }}
-                        onMouseUp={() => { dragFromHandle.current = false; }}
-                        className="text-gray-300 hover:text-gray-500 cursor-grab active:cursor-grabbing select-none text-lg shrink-0 px-1"
-                        title="ドラッグして並び替え"
-                      >
-                        ⠿
-                      </span>
-                    )}
-                    <button
-                      onClick={() => handleToggleEnabled(k.id, !k.enabled)}
-                      title={k.enabled !== false ? "生成に使用中（クリックでOFF）" : "生成で未使用（クリックでON）"}
-                      className={`relative w-10 h-5 rounded-full transition-colors flex-shrink-0 ${
-                        k.enabled !== false ? "bg-green-400" : "bg-gray-300"
-                      }`}
-                    >
-                      <span
-                        className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${
-                          k.enabled !== false ? "translate-x-5" : "translate-x-0"
-                        }`}
-                      />
-                    </button>
-                    <div>
-                      <span className="font-bold text-gray-800">{k.title}</span>
-                      <span className="ml-2 px-2 py-0.5 rounded text-xs bg-gray-100 text-gray-500">
-                        {typeLabels[k.type] || k.type}
-                      </span>
-                      <span
-                        className={`ml-1 px-2 py-0.5 rounded text-xs ${
-                          k.accountId
-                            ? "bg-purple-50 text-purple-600"
-                            : "bg-emerald-50 text-emerald-600"
-                        }`}
-                      >
-                        {accountName(k.accountId)}
-                      </span>
-                      {k.isDefault && (
-                        <span className="ml-1 px-2 py-0.5 rounded text-xs bg-blue-50 text-blue-500">
-                          デフォルト
-                        </span>
-                      )}
-                      {k.enabled === false && (
-                        <span className="ml-1 px-2 py-0.5 rounded text-xs bg-orange-50 text-orange-500">
-                          OFF
-                        </span>
-                      )}
-                      <p className="text-xs text-gray-400 mt-1">
-                        {k.content.slice(0, 100)}...
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => startAiEdit(k.id)}
-                      disabled={aiEditingId === k.id}
-                      className="px-3 py-1.5 rounded-lg text-sm font-medium text-purple-600 bg-purple-50 hover:bg-purple-100 disabled:opacity-50"
-                    >
-                      AI編集
-                    </button>
-                    <button
-                      onClick={() => startEdit(k)}
-                      className="px-4 py-1.5 rounded-lg text-sm text-gray-500 hover:bg-gray-100"
-                    >
-                      編集
-                    </button>
-                  </div>
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="font-bold text-gray-800">{k.title}</span>
+                  <span className="ml-2 px-2 py-0.5 rounded text-xs bg-gray-100 text-gray-500">
+                    {typeLabels[k.type] || k.type}
+                  </span>
+                  <span
+                    className={`ml-1 px-2 py-0.5 rounded text-xs ${
+                      k.accountId
+                        ? "bg-purple-50 text-purple-600"
+                        : "bg-emerald-50 text-emerald-600"
+                    }`}
+                  >
+                    {accountName(k.accountId)}
+                  </span>
+                  {k.isDefault && (
+                    <span className="ml-1 px-2 py-0.5 rounded text-xs bg-blue-50 text-blue-500">
+                      デフォルト
+                    </span>
+                  )}
+                  {k.enabled === false && (
+                    <span className="ml-1 px-2 py-0.5 rounded text-xs bg-gray-100 text-gray-400">
+                      生成で未使用
+                    </span>
+                  )}
+                  <p className="text-xs text-gray-400 mt-1">
+                    {k.content.slice(0, 100)}...
+                  </p>
                 </div>
-                {/* AI編集パネル */}
-                {aiEditingId === k.id && (
-                  <div className="mt-3 p-4 rounded-lg border border-purple-200 bg-purple-50/50">
-                    <div className="flex items-center gap-2 mb-2">
-                      <span className="text-sm font-medium text-purple-700">AI編集</span>
-                      <span className="text-xs text-purple-500">AIに指示してナレッジを編集</span>
-                    </div>
-                    <textarea
-                      value={aiInstruction}
-                      onChange={(e) => setAiInstruction(e.target.value)}
-                      disabled={aiProcessing}
-                      rows={3}
-                      placeholder={`例:\n・悩み投稿を3つ追加して\n・もっと具体的なエピソードを入れて\n・「退職代行」に関する項目を追加して`}
-                      className="w-full px-3 py-2 rounded-lg border border-purple-200 text-sm focus:outline-none focus:border-purple-400 resize-y leading-relaxed bg-white"
+                <div className="flex items-center gap-2 shrink-0">
+                  {/* ON/OFFトグル */}
+                  <button
+                    onClick={() => handleToggleEnabled(k.id, !(k.enabled !== false))}
+                    title={
+                      k.enabled !== false
+                        ? "生成に使用中（クリックでOFF）"
+                        : "生成で未使用（クリックでON）"
+                    }
+                    className={`relative w-10 h-5 rounded-full transition-colors ${
+                      k.enabled !== false ? "bg-green-400" : "bg-gray-300"
+                    }`}
+                  >
+                    <span
+                      className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                        k.enabled !== false ? "translate-x-5" : "translate-x-0"
+                      }`}
                     />
-                    {aiError && (
-                      <div className="mt-2 p-2 rounded-lg bg-red-50 border border-red-200 text-xs text-red-600 whitespace-pre-wrap">
-                        {aiError}
-                      </div>
-                    )}
-                    {aiProcessing && (
-                      <div className="mt-2 p-2 rounded-lg bg-blue-50 border border-blue-200 text-xs text-blue-600">
-                        AIが編集中...（1〜2分かかります）
-                      </div>
-                    )}
-                    {aiPreview && (
-                      <div className="mt-2">
-                        <div className="text-xs font-medium text-purple-600 mb-1">
-                          編集結果プレビュー:
-                        </div>
-                        <div className="p-3 rounded-lg border border-gray-200 bg-white text-sm text-gray-700 max-h-60 overflow-y-auto whitespace-pre-wrap font-mono leading-relaxed">
-                          {aiPreview}
-                        </div>
-                      </div>
-                    )}
-                    <div className="flex gap-2 mt-3">
-                      {!aiPreview ? (
-                        <button
-                          onClick={handleAiGenerate}
-                          disabled={aiProcessing || !aiInstruction.trim()}
-                          className="px-4 py-2 rounded-lg text-sm font-medium text-white disabled:opacity-50"
-                          style={{ background: "var(--accent)" }}
-                        >
-                          {aiProcessing ? "処理中..." : "AIで編集"}
-                        </button>
-                      ) : (
-                        <>
-                          <button
-                            onClick={handleAiApply}
-                            disabled={saving}
-                            className="px-4 py-2 rounded-lg text-sm font-medium text-white disabled:opacity-50"
-                            style={{ background: "var(--accent)" }}
-                          >
-                            {saving ? "保存中..." : "この内容で保存"}
-                          </button>
-                          <button
-                            onClick={() => { setAiPreview(null); setAiError(""); }}
-                            className="px-4 py-2 rounded-lg text-sm text-purple-600 hover:bg-purple-100"
-                          >
-                            やり直し
-                          </button>
-                        </>
-                      )}
-                      <button
-                        onClick={cancelAiEdit}
-                        disabled={aiProcessing}
-                        className="px-4 py-2 rounded-lg text-sm text-gray-500 hover:bg-gray-100"
-                      >
-                        閉じる
-                      </button>
+                  </button>
+                  <button
+                    onClick={() => {
+                      resetAiEdit();
+                      setAiEditingId(k.id);
+                    }}
+                    disabled={aiEditingId === k.id}
+                    className="px-3 py-1.5 rounded-lg text-sm text-purple-600 hover:bg-purple-50 disabled:opacity-50"
+                  >
+                    AI編集
+                  </button>
+                  <button
+                    onClick={() => startEdit(k)}
+                    className="px-4 py-1.5 rounded-lg text-sm text-gray-500 hover:bg-gray-100"
+                  >
+                    編集
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* ナレッジAI編集パネル */}
+            {aiEditingId === k.id && editing !== k.id && (
+              <div className="mt-3 p-3 rounded-lg border border-purple-200 bg-purple-50">
+                <span className="text-sm font-medium text-purple-700">
+                  🤖 AI編集
+                </span>
+                <textarea
+                  value={aiInstruction}
+                  onChange={(e) => setAiInstruction(e.target.value)}
+                  disabled={aiProcessing}
+                  rows={2}
+                  placeholder="例: もっと具体例を増やして / 重複している項目を整理して / 禁止表現を3つ追加して"
+                  className="mt-2 w-full px-3 py-2 rounded-lg border border-purple-300 text-sm focus:outline-none focus:border-purple-500 bg-white disabled:opacity-50"
+                />
+                {aiError && <p className="text-xs text-red-600 mt-1">{aiError}</p>}
+                {aiProcessing && (
+                  <p className="text-xs text-purple-600 mt-2">
+                    AIが編集案を作成中です…（少し時間がかかります）
+                  </p>
+                )}
+                {aiPreview && (
+                  <div className="mt-2">
+                    <p className="text-xs text-purple-600 mb-1">編集案のプレビュー：</p>
+                    <div className="text-sm whitespace-pre-wrap text-gray-800 bg-white p-3 rounded-lg border border-purple-200 max-h-60 overflow-y-auto leading-relaxed">
+                      {aiPreview}
                     </div>
                   </div>
                 )}
+                <div className="flex gap-2 mt-2">
+                  {!aiPreview ? (
+                    <button
+                      onClick={handleAiGenerate}
+                      disabled={aiProcessing || !aiInstruction.trim()}
+                      className="px-3 py-1.5 rounded-md text-xs font-medium text-white transition-opacity hover:opacity-80 disabled:opacity-40"
+                      style={{ background: "#7b1fa2" }}
+                    >
+                      {aiProcessing ? "処理中..." : "AIで編集"}
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        onClick={handleAiApply}
+                        className="px-3 py-1.5 rounded-md text-xs font-medium text-white transition-opacity hover:opacity-80"
+                        style={{ background: "#7b1fa2" }}
+                      >
+                        この内容で保存
+                      </button>
+                      <button
+                        onClick={() => {
+                          setAiPreview(null);
+                          setAiError("");
+                        }}
+                        className="px-3 py-1.5 rounded-md text-xs font-medium text-gray-700 bg-gray-200 transition-opacity hover:opacity-80"
+                      >
+                        やり直す
+                      </button>
+                    </>
+                  )}
+                  <button
+                    onClick={resetAiEdit}
+                    disabled={aiProcessing}
+                    className="px-3 py-1.5 rounded-md text-xs font-medium text-gray-500 hover:bg-gray-100 disabled:opacity-50"
+                  >
+                    閉じる
+                  </button>
+                </div>
               </div>
             )}
           </div>
@@ -1123,64 +1076,63 @@ function KnowledgeSection() {
           </div>
         )}
       </div>
+
+      {/* 右側：全文プレビュー欄（大画面のみ・追従表示） */}
+      <div className="hidden lg:block">
+        <ContentPreviewPanel
+          title={previewTitle}
+          content={previewContent}
+          badge={previewBadge}
+          emptyText="左のナレッジをクリックすると、ここに全文が表示されます。"
+        />
       </div>
-      <ContentPreviewPanel
-        title={previewTitle}
-        subtitle={previewSubtitle}
-        content={previewContent}
-        badge={previewBadge}
-        emptyText="ナレッジを選択、または編集すると全文がここに表示されます。"
-      />
+      </div>
     </section>
   );
 }
 
 function ContentPreviewPanel({
   title,
-  subtitle,
   content,
   badge,
   emptyText,
 }: {
   title: string;
-  subtitle?: string;
   content: string;
   badge?: string;
   emptyText: string;
 }) {
   const hasContent = content.trim().length > 0;
-
   return (
     <aside className="lg:sticky lg:top-6 self-start min-w-0">
-      <div className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden">
-        <div className="px-4 py-3 border-b border-gray-100 bg-gray-50">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <h3 className="text-sm font-bold text-gray-800 truncate">
-                {title}
-              </h3>
-              {subtitle && (
-                <p className="mt-0.5 text-xs text-gray-400 truncate">
-                  {subtitle}
-                </p>
-              )}
-            </div>
-            {badge && (
-              <span className="shrink-0 rounded-full bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-600">
-                {badge}
-              </span>
-            )}
-          </div>
+      <div
+        className="flex flex-col rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden"
+        style={{ height: "calc(100vh - 170px)", minHeight: "480px" }}
+      >
+        <div className="px-4 py-3 border-b border-gray-100 bg-gray-50 flex items-start justify-between gap-3">
+          <h3 className="text-sm font-bold text-gray-800 truncate min-w-0">
+            {title}
+          </h3>
+          {badge && (
+            <span className="shrink-0 rounded-full bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-600">
+              {badge}
+            </span>
+          )}
         </div>
-        <div className="max-h-[calc(100dvh-96px)] min-h-[420px] overflow-y-auto p-4">
+        <div className="flex-1 overflow-y-auto p-4">
           {hasContent ? (
-            <pre className="whitespace-pre-wrap break-words font-mono text-[13px] leading-6 text-gray-700">
+            <pre className="whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-800 font-sans">
               {content}
             </pre>
           ) : (
-            <p className="text-sm leading-6 text-gray-400">{emptyText}</p>
+            <p className="text-sm text-gray-400">{emptyText}</p>
           )}
         </div>
+        {hasContent && (
+          <div className="px-4 py-2 border-t border-gray-100 bg-gray-50 text-[11px] text-gray-400">
+            {content.length} 文字
+          </div>
+        )}
       </div>
     </aside>
   );
@@ -1227,33 +1179,17 @@ function KnowledgeForm({
 }) {
   return (
     <div className="space-y-3">
-      <div className="flex gap-3">
-        <div className="flex-1">
-          <label className="block text-xs font-medium text-gray-500 mb-1">
-            タイトル
-          </label>
-          <input
-            type="text"
-            value={form.title}
-            onChange={(e) => setForm({ ...form, title: e.target.value })}
-            placeholder="例: 投稿生成ルール"
-            className="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-blue-300"
-          />
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-gray-500 mb-1">
-            種別
-          </label>
-          <select
-            value={form.type}
-            onChange={(e) => setForm({ ...form, type: e.target.value })}
-            className="px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-blue-300"
-          >
-            <option value="rules">生成ルール</option>
-            <option value="structures">構成パターン</option>
-            <option value="custom">カスタム</option>
-          </select>
-        </div>
+      <div>
+        <label className="block text-xs font-medium text-gray-500 mb-1">
+          タイトル
+        </label>
+        <input
+          type="text"
+          value={form.title}
+          onChange={(e) => setForm({ ...form, title: e.target.value })}
+          placeholder="例: 投稿の口調ルール"
+          className="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-blue-300"
+        />
       </div>
       <div>
         <label className="block text-xs font-medium text-gray-500 mb-1">
@@ -1274,7 +1210,7 @@ function KnowledgeForm({
           ))}
         </select>
         <p className="text-xs text-gray-400 mt-1">
-          特定アカウントを選ぶと、そのアカウントの生成時にだけ「共通ナレッジ＋このナレッジ」がマージされます。ジャンル別（稼ぐ系・スピ系等）の出し分けに使います。
+          特定のアカウントだけに反映したい内容がある場合は、そのアカウントを選んでください。迷ったら「全アカウント共通」のままでOKです。
         </p>
       </div>
       <div>

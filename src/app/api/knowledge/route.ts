@@ -32,9 +32,9 @@ export async function POST(request: Request) {
   try {
     const { accountId, type, title, content, isDefault } = await request.json();
 
-    if (!type || !title || !content) {
+    if (!title || !content) {
       return NextResponse.json(
-        { error: "type, title, content required" },
+        { error: "タイトルと内容を入力してください。" },
         { status: 400 }
       );
     }
@@ -47,7 +47,7 @@ export async function POST(request: Request) {
     const knowledge = await prisma.knowledge.create({
       data: {
         accountId: accountId || null,
-        type,
+        type: type || "custom",
         title,
         content,
         isDefault: isDefault || false,

@@ -11,6 +11,12 @@
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_RETRIES = 2;
+export const REQUIRED_GAS_VERSION = "webapp-v1.1.11";
+
+type GasCallOptions = {
+  timeoutMs?: number;
+  retries?: number;
+};
 
 export type GasEndpoint = {
   url: string;
@@ -23,6 +29,36 @@ export type GasResponse<T = unknown> = {
   error?: string;
   httpStatus?: number;
 };
+
+function parseWebappVersion(version: string | null | undefined): number[] | null {
+  if (!version) return null;
+  const m = String(version).match(/^webapp-v(\d+)\.(\d+)\.(\d+)$/);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+export function isGasVersionSupported(version: string | null | undefined): boolean {
+  const current = parseWebappVersion(version);
+  const required = parseWebappVersion(REQUIRED_GAS_VERSION);
+  if (!current || !required) return false;
+  for (let i = 0; i < required.length; i++) {
+    if (current[i] > required[i]) return true;
+    if (current[i] < required[i]) return false;
+  }
+  return true;
+}
+
+function gasVersionLabel(version: string | null | undefined): string {
+  return version ? String(version).replace(/^webapp-/, "") : "不明";
+}
+
+export function gasVersionUpgradeMessage(version: string | null | undefined): string {
+  return (
+    "アプリ本体は更新済みです。Google側の投稿コードだけが古い状態です。" +
+    ` Google側の現在版: ${gasVersionLabel(version)}。最新版: ${gasVersionLabel(REQUIRED_GAS_VERSION)}。` +
+    "この画面、または設定のクラウドオフロード欄にある「Google投稿を修復する」を押してください。"
+  );
+}
 
 /** UTC Date → JST "YYYY-MM-DDTHH:mm"（秒は丸めて分単位、GAS側 parseJstDateTime_ と整合） */
 export function toJstString(d: Date): string {
@@ -66,7 +102,10 @@ async function postToGas<T = unknown>(
       try {
         parsed = JSON.parse(text);
       } catch {
-        lastError = `GAS返却がJSONとしてパース不可 (HTTP ${resp.status}): ${text.slice(0, 200)}`;
+        const looksLikeHtml = /<!doctype html|<html[\s>]/i.test(text);
+        lastError = looksLikeHtml
+          ? `Google側から確認用データではなく画面用HTMLが返りました (HTTP ${resp.status})。GASの反映待ち、またはWeb Appの公開設定を確認してください。`
+          : `GAS返却がJSONとして読み取れませんでした (HTTP ${resp.status})。`;
         // JSONパース失敗は永続エラー扱い、リトライしない
         return { ok: false, error: lastError, httpStatus: resp.status };
       }
@@ -102,7 +141,7 @@ async function postToGas<T = unknown>(
 // アクション別ラッパー
 // ============================================
 
-export async function healthCheck(endpoint: GasEndpoint) {
+export async function healthCheck(endpoint: GasEndpoint, opts: GasCallOptions = {}) {
   return postToGas<{
     version: string;
     configured: boolean;
@@ -115,7 +154,14 @@ export async function healthCheck(endpoint: GasEndpoint) {
     tokenLastError?: string | null;
     scriptTimeZone?: string;
     spreadsheetTimeZone?: string;
-  }>(endpoint, { action: "healthCheck" }, { retries: 1 });
+    triggerResetAt?: string | null;
+    lastProcessAttemptAt?: string | null;
+    lastProcessFinishAt?: string | null;
+    lastProcessSkippedAt?: string | null;
+    lastProcessSummary?: string | null;
+    lastProcessErrorAt?: string | null;
+    lastProcessError?: string | null;
+  }>(endpoint, { action: "healthCheck" }, { retries: opts.retries ?? 1, timeoutMs: opts.timeoutMs });
 }
 
 /**
@@ -130,7 +176,8 @@ export async function healthCheck(endpoint: GasEndpoint) {
  */
 export async function setConfig(
   endpoint: Omit<GasEndpoint, "key"> & { key?: string },
-  params: { token: string; webappKey: string; webappUrl: string }
+  params: { token: string; webappKey: string; webappUrl: string },
+  opts: GasCallOptions = {}
 ) {
   return postToGas<{
     user_id: string;
@@ -146,7 +193,7 @@ export async function setConfig(
       webapp_key: params.webappKey,
       webapp_url: params.webappUrl,
     },
-    { retries: 1, timeoutMs: 30_000 }
+    { retries: opts.retries ?? 1, timeoutMs: opts.timeoutMs ?? 30_000 }
   );
 }
 
@@ -157,7 +204,60 @@ export type PushPostInput = {
   postType: "standalone" | "thread";
   publishAtJst: string; // "YYYY-MM-DDTHH:mm"
   memo?: string;
+  imageUrls?: string[]; // 添付画像の公開URL（カルーセル対応）。GAS側 MEDIA列(P)へ
 };
+
+/**
+ * uploadMedia: 画像をbase64でGASに送り、Drive保存→公開直リンクを受け取る
+ * （クラウドオフロード設定済みアカウントのみ。GASのdrive.fileスコープを使う）
+ */
+export async function uploadMedia(
+  endpoint: GasEndpoint,
+  params: { base64: string; mimeType: string; fileName: string; webPostId?: string }
+) {
+  return postToGas<{ driveFileId: string; publicUrl: string; altUrl?: string }>(
+    endpoint,
+    { action: "uploadMedia", ...params },
+    { retries: 1, timeoutMs: 60_000 }
+  );
+}
+
+/** GAS が画像のクリーンアップ（deleteMedia/pruneMedia）に対応した版か（v1.1.12以降） */
+export function isGasMediaCleanupSupported(version: string | null | undefined): boolean {
+  const current = parseWebappVersion(version);
+  const min = [1, 1, 12];
+  if (!current) return false;
+  for (let i = 0; i < min.length; i++) {
+    if (current[i] > min[i]) return true;
+    if (current[i] < min[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * deleteMedia: 指定したDriveメディアをゴミ箱へ（画像×削除/投稿削除時のクリーンアップ）。
+ * ベストエフォート（旧GASや失敗時は ok:false を返すが、呼び出し側は無視してよい）。
+ */
+export async function deleteMedia(endpoint: GasEndpoint, fileIds: string[]) {
+  const ids = fileIds.filter(Boolean);
+  if (ids.length === 0) return { ok: true, data: { trashed: 0 } };
+  return postToGas<{ trashed: number; failed: string[] }>(
+    endpoint,
+    { action: "deleteMedia", fileIds: ids },
+    { retries: 1, timeoutMs: 20_000 }
+  );
+}
+
+/**
+ * pruneMedia: メディアフォルダ内で keepIds に無い孤立ファイルをゴミ箱へ（既存の溜まり整理）。
+ */
+export async function pruneMedia(endpoint: GasEndpoint, keepIds: string[]) {
+  return postToGas<{ trashed: number; kept: number }>(
+    endpoint,
+    { action: "pruneMedia", keepIds: keepIds.filter(Boolean) },
+    { retries: 1, timeoutMs: 60_000 }
+  );
+}
 
 export async function pushQueue(
   endpoint: GasEndpoint,
@@ -168,6 +268,33 @@ export async function pushQueue(
     startRow: number;
     webPostIds: string[];
   }>(endpoint, { action: "pushQueue", posts });
+}
+
+export type QueueVerificationRow = {
+  webPostId: string;
+  status: string;
+  row: number;
+};
+
+export async function verifyQueueByPostIds(
+  endpoint: GasEndpoint,
+  webPostIds: string[]
+) {
+  if (webPostIds.length === 0) {
+    return {
+      ok: true,
+      data: {
+        present: [] as string[],
+        missing: [] as string[],
+        rows: [] as QueueVerificationRow[],
+      },
+    };
+  }
+  return postToGas<{
+    present: string[];
+    missing: string[];
+    rows: QueueVerificationRow[];
+  }>(endpoint, { action: "verifyQueueByPostIds", webPostIds });
 }
 
 export async function updateByPostId(

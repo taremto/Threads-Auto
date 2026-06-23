@@ -185,9 +185,9 @@ echo ""
 
 # --------------------------------------------------
 # Step 4: GASプロジェクト作成 + コードPush
-#   （既に設定済みなら「GASコードだけ最新に更新」モードを提供）
+#   （既に設定済みなら「Google投稿を修復」モードを提供）
 # --------------------------------------------------
-echo "[4/8] スプレッドシート作成 + GASコードPush..."
+echo "[4/8] スプレッドシート作成 + Google投稿コードPush..."
 GAS_WORK_DIR="$SCRIPT_DIR/gas-deploy/$ACCOUNT_ID"
 
 if [ -f "$GAS_WORK_DIR/.clasp.json" ] && [ -n "$GAS_WEBAPP_URL" ]; then
@@ -196,54 +196,42 @@ if [ -f "$GAS_WORK_DIR/.clasp.json" ] && [ -n "$GAS_WEBAPP_URL" ]; then
   echo "  このアカウント「$ACCOUNT_NAME」は既にクラウドオフロード設定済みです。"
   echo "    現在の Web App URL: $GAS_WEBAPP_URL"
   echo ""
-  echo "    ① GASのコードを最新版に更新する（スプシ・URL・トークンはそのまま。アップデート後はこれを推奨）"
+  echo "    ① Google投稿を修復する（コード・自動実行・URL・予約キューを確認）"
   echo "    ② 最初からやり直す（新しいスプレッドシートを作り直す）"
   echo ""
   read -r -p "  どうしますか？ [1/2]: " SETUP_MODE || { echo "❌ 入力が読み取れませんでした。ターミナルの窓の中で対話的に実行してください。"; exit 1; }
   case "$SETUP_MODE" in
     1)
       echo ""
-      echo "[GASコード更新] 最新のGASコードを反映します..."
-      cd "$GAS_WORK_DIR"
-      cp "$GAS_DIR/appscript.gs" .
-      cp "$GAS_DIR/appsscript.json" .
-      SCRIPT_ID=$(node -e "console.log(JSON.parse(require('fs').readFileSync('.clasp.json','utf8')).scriptId)")
-      echo "  コードをPush中（scriptId: $SCRIPT_ID）..."
-      clasp push --force >/dev/null
-      # Web App URL からデプロイIDを取り出す: https://script.google.com/macros/s/<DEPLOY_ID>/exec
-      DEPLOY_ID=$(printf '%s' "$GAS_WEBAPP_URL" | sed -E 's#.*/macros/s/([^/]+)/exec.*#\1#')
-      echo "  デプロイを更新中（deploymentId: ${DEPLOY_ID:0:14}…）..."
-      if [ -n "$DEPLOY_ID" ] && clasp deploy --deploymentId "$DEPLOY_ID" --description "コード更新 $(date +%F)" >/dev/null 2>&1; then
-        cd "$SCRIPT_DIR"
-        echo ""
-        echo "════════════════════════════════════════════════"
-        echo " ✅ GASコードを最新版に更新しました"
-        echo "════════════════════════════════════════════════"
-        echo ""
-        echo "  Web App URL は変わっていません（$GAS_WEBAPP_URL）。"
-        echo "  スプレッドシート・Threadsトークン・認証キーもそのままです。"
-        echo "  これで「下書きに戻す」したときにスプシから行が消える／同じ投稿を再キューできる、になります。"
-        echo ""
-        echo "  （このターミナルの窓は閉じて大丈夫です）"
-        echo ""
-        exit 0
-      else
-        cd "$SCRIPT_DIR"
-        echo ""
-        echo "⚠ 自動でのデプロイ更新ができませんでした。GASエディタを開くので、手動で更新してください："
-        echo "    1. 右上「デプロイ」→「デプロイを管理」"
-        echo "    2. 該当の「ウェブアプリ」の行で 鉛筆アイコン（編集）をクリック"
-        echo "    3. 「バージョン」を「新しいバージョン」に変更 → 「デプロイ」"
-        echo "  （これでURLは変わらず、コードだけ最新になります）"
-        echo ""
-        echo "  エディタ: https://script.google.com/d/${SCRIPT_ID}/edit"
-        sleep 2
-        open_url "https://script.google.com/d/${SCRIPT_ID}/edit"
-        echo ""
-        echo "  手動更新が終わったら、このターミナルは閉じて大丈夫です。"
-        echo ""
-        exit 0
+      echo "[Google投稿の修復] アプリからGoogle側を修復します..."
+      REPAIR_PAYLOAD=$(SC_ACCOUNT_ID="$ACCOUNT_ID" node -e 'console.log(JSON.stringify({action:"repairCloudPosting",accountId:process.env.SC_ACCOUNT_ID}))')
+      REPAIR_RESP=$(curl -s -X POST "$WEB_URL/api/cloud/setup" \
+        -H "Content-Type: application/json" \
+        -d "$REPAIR_PAYLOAD")
+      REPAIR_OK=$(echo "$REPAIR_RESP" | json_parse 'd.ok ? "ok" : ("ng:" + (d.error || "?"))')
+      if [ "$REPAIR_OK" != "ok" ]; then
+        echo "❌ Google投稿の修復に失敗しました: $REPAIR_OK"
+        echo "   レスポンス: $REPAIR_RESP"
+        echo "   アプリの「自動投稿チェック」からサポート用レポートをコピーして送ってください。"
+        exit 1
       fi
+      NEW_URL=$(echo "$REPAIR_RESP" | json_parse 'd.gasWebAppUrl || ""')
+      REPAIRED_QUEUED=$(echo "$REPAIR_RESP" | json_parse 'd.repairedQueued || 0')
+      echo ""
+      echo "════════════════════════════════════════════════"
+      echo " ✅ Google投稿を修復しました"
+      echo "════════════════════════════════════════════════"
+      echo ""
+      if [ -n "$NEW_URL" ]; then
+        echo "  動作確認済みURL: $NEW_URL"
+      fi
+      if [ "$REPAIRED_QUEUED" != "0" ]; then
+        echo "  Google側で確認した予約: $REPAIRED_QUEUED 件"
+      fi
+      echo "  コード・自動実行・タイムゾーン・投稿用トークンを確認済みです。"
+      echo "  （このターミナルの窓は閉じて大丈夫です）"
+      echo ""
+      exit 0
       ;;
     2)
       echo ""
@@ -288,11 +276,13 @@ SS_TITLE="Threads自動投稿_${ACCOUNT_NAME}"
 echo "  スプシ「$SS_TITLE」を作成中..."
 clasp create --type sheets --title "$SS_TITLE" --rootDir "$GAS_WORK_DIR" >/dev/null
 
-# rootDir が空のままだと push がスキップされる既知問題対策
+# rootDir が空のままだと push がスキップされる既知問題対策。
+# Windows では Unix形式の絶対パス（/d/...）を clasp(Node) が解決できず空 push に
+# なるため、相対パス "." を使う（このブロックは cd "$GAS_WORK_DIR" 済みの場所で動く）。
 node -e "
   const fs=require('fs');
   const j=JSON.parse(fs.readFileSync('.clasp.json','utf8'));
-  j.rootDir='$GAS_WORK_DIR';
+  j.rootDir='.';
   fs.writeFileSync('.clasp.json', JSON.stringify(j, null, 2));
 "
 
@@ -396,13 +386,13 @@ fi
 SCRIPT_TZ=$(echo "$INIT_RESP" | json_parse 'd.scriptTimeZone')
 if [ "$SCRIPT_TZ" != "Asia/Tokyo" ]; then
   if [ -z "$SCRIPT_TZ" ]; then
-    SCRIPT_TZ_LABEL="未返却（GASコードが古い/反映されていない可能性）"
+    SCRIPT_TZ_LABEL="未返却（Google側のコードが古い/反映されていない可能性）"
   else
     SCRIPT_TZ_LABEL="$SCRIPT_TZ"
   fi
   echo "❌ GASプロジェクトのタイムゾーンが Asia/Tokyo ではありません: $SCRIPT_TZ_LABEL"
   echo "   このままだと予約時刻がズレて投稿されません（GAS側の安全弁が発動します）。"
-  echo "   GASコード更新または Apps Scriptエディタの「プロジェクトの設定（⚙️） → タイムゾーン」を Asia/Tokyo に変更してから、もう一度このスクリプトを実行してください。"
+  echo "   Google投稿の修復、または Apps Scriptエディタの「プロジェクトの設定（⚙️） → タイムゾーン」を Asia/Tokyo に変更してから、もう一度このスクリプトを実行してください。"
   exit 1
 fi
 USER_ID=$(echo "$INIT_RESP" | json_parse 'd.userId')

@@ -13,7 +13,7 @@ type AccountStats = {
   total: number;
 };
 
-type Tab = "draft" | "queued" | "posted";
+type Tab = "draft" | "queued" | "posted" | "error";
 
 type OverviewPageProps = {
   onNavigate: (accountId: string, tab: Tab) => void;
@@ -84,7 +84,12 @@ export default function OverviewPage({ onNavigate }: OverviewPageProps) {
           color="#4caf50"
           onClick={firstId ? () => onNavigate(firstId, "posted") : undefined}
         />
-        <StatCard label="エラー" value={totals.error} color="#f44336" />
+        <StatCard
+          label="エラー"
+          value={totals.error}
+          color="#f44336"
+          onClick={firstId ? () => onNavigate(firstId, "error") : undefined}
+        />
       </div>
 
       {/* アカウント別 */}
@@ -138,7 +143,12 @@ export default function OverviewPage({ onNavigate }: OverviewPageProps) {
                     color="#4caf50"
                     onClick={() => onNavigate(s.id, "posted")}
                   />
-                  <MiniStat label="エラー" value={s.error} color="#f44336" />
+                  <MiniStat
+                    label="エラー"
+                    value={s.error}
+                    color="#f44336"
+                    onClick={() => onNavigate(s.id, "error")}
+                  />
                 </div>
               </div>
             ))}

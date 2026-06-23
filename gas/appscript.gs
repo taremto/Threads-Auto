@@ -40,12 +40,20 @@ var COL = {
   ERROR:       13,   // M: エラー
   WEB_POST_ID: 14,   // N: Webアプリ側 Post.id（Push時に書き込み）
   SYNCED:      15,   // O: Web取込済 ("1"=ack済)
+  MEDIA:       16,   // P: 添付メディアURL（JSON配列。画像カルーセル対応。空=テキスト投稿）
 };
 var TOTAL_COLS = 13;       // v3互換: TSV書き込み等の既存パスはここまで
-var TOTAL_COLS_V2 = 15;    // Web連携拡張カラム含む
+var TOTAL_COLS_V2 = 16;    // Web連携拡張カラム含む（N:WebID O:取込済 P:メディア）
 var API_BASE_ = 'https://graph.threads.net/v1.0/';
-var GAS_VERSION = 'webapp-v1.0.0';
+var GAS_VERSION = 'webapp-v1.1.12';
 var POST_INTERVAL_MIN = 60; // 凍結対策: 直近postedから60分以内なら投稿スキップ
+// 予約時刻からの猶予分数。GAS の時間ベーストリガーは「分の中で誤差を持って発火」する仕様
+// （例: 12:13 トリガーが 12:13:58 に走り、スプシ判定時には 12:14:01 になることがある）。
+// 旧値 1 分だと58秒で発火した場合に構造的にスキップが発生していた。WebUI 側 scheduler.ts の
+// 同等ガード（15分）と統一し、誤差を吸収する。
+var PAST_DUE_GRACE_MIN = 15;
+var PENDING_SUCCESS_PREFIX = 'POST_SUCCESS_PENDING_';
+var PENDING_SUCCESS_TTL_DAYS = 30;
 
 // ============================================
 // セキュリティ & 設定
@@ -198,6 +206,8 @@ function onOpen() {
     .addItem('テスト投稿', 'testScheduledPost')
     .addSeparator()
     .addItem('📱 プレビュー', 'openPreview')
+    .addSeparator()
+    .addItem('🖼 画像投稿のDrive権限を承認', 'authorizeDrive')
     .addToUi();
 
   if (!SpreadsheetApp.getActiveSpreadsheet().getSheetByName('投稿管理')) {
@@ -566,23 +576,105 @@ function testConnection() {
  * @param {string} replyToId - スレッド投稿時の親投稿ID
  * @return {object} { id: 公開ポストID, containerId: コンテナID }
  */
-function postToThreads_(text, imageUrl, replyToId) {
+/** media引数(配列 / JSON文字列 / 単一URL文字列 / 空)を URL配列に正規化 */
+function normalizeMedia_(media) {
+  if (!media) return [];
+  if (Array.isArray(media)) return media.filter(function(u){ return u; });
+  var s = String(media).trim();
+  if (s === '') return [];
+  if (s.charAt(0) === '[') {
+    try {
+      var arr = JSON.parse(s);
+      if (Array.isArray(arr)) return arr.filter(function(u){ return u; });
+    } catch (e) {}
+  }
+  return [s];
+}
+
+/** 画像ホスティング用のDriveフォルダを取得（無ければ作成）。
+ *  drive.file スコープでも確実に再利用できるよう、作成したフォルダIDをProperties保存する。 */
+function getOrCreateMediaFolder_() {
+  var props = PropertiesService.getScriptProperties();
+  var saved = props.getProperty('MEDIA_FOLDER_ID');
+  if (saved) {
+    try {
+      return DriveApp.getFolderById(saved);
+    } catch (e) { /* 削除された等 → 作り直す */ }
+  }
+  var name = 'ThreadsAutoMedia';
+  var folder;
+  try {
+    var it = DriveApp.getFoldersByName(name);
+    folder = it.hasNext() ? it.next() : DriveApp.createFolder(name);
+  } catch (e2) {
+    folder = DriveApp.createFolder(name);
+  }
+  props.setProperty('MEDIA_FOLDER_ID', folder.getId());
+  return folder;
+}
+
+/**
+ * 画像投稿に必要な Google Drive 権限を承認するための関数。
+ * メニュー「🖼 画像投稿のDrive権限を承認」or エディタから一度実行すると Drive の承認画面が出る。
+ * 許可すると以降の画像アップロード(uploadMedia)が通る。ついでにメディア用フォルダも作っておく。
+ */
+function authorizeDrive() {
+  var folder = getOrCreateMediaFolder_();
+  try {
+    SpreadsheetApp.getUi().alert('✅ 画像投稿のGoogle Drive権限が承認されました。\n保存先フォルダ: ' + folder.getName());
+  } catch (e) {
+    Logger.log('Drive権限の承認OK / folder=' + folder.getName());
+  }
+}
+
+/**
+ * Threadsへ投稿する。
+ * @param {string} text
+ * @param {string|string[]} media - 画像の公開URL（空=テキスト, 1枚=IMAGE, 2枚以上=CAROUSEL）
+ * @param {string} replyToId
+ */
+function postToThreads_(text, media, replyToId) {
   var c = getConfig_();
   if (!c.token || !c.userId) {
     throw new Error('API未設定。「自動投稿」>「API設定」から設定してください。');
   }
 
-  var payload = {
-    media_type: imageUrl ? 'IMAGE' : 'TEXT',
-    text: text,
-  };
-  if (imageUrl) payload.image_url = imageUrl;
-  if (replyToId) payload.reply_to_id = replyToId;
+  var urls = normalizeMedia_(media);
+  var created;
 
-  // Step1: コンテナ作成
-  var created = apiPost_(c.userId + '/threads', payload);
+  if (urls.length >= 2) {
+    // カルーセル: is_carousel_item の子コンテナをN個作り、親CAROUSELでまとめる
+    var children = [];
+    for (var ci = 0; ci < urls.length; ci++) {
+      var child = apiPost_(c.userId + '/threads', {
+        media_type: 'IMAGE',
+        image_url: urls[ci],
+        is_carousel_item: true,
+      });
+      children.push(child.id);
+      Utilities.sleep(2000); // 子コンテナの準備待ち
+    }
+    var carouselPayload = {
+      media_type: 'CAROUSEL',
+      children: children.join(','),
+      text: text,
+    };
+    if (replyToId) carouselPayload.reply_to_id = replyToId;
+    created = apiPost_(c.userId + '/threads', carouselPayload);
+    Utilities.sleep(3000);
+  } else {
+    var imageUrl = urls.length === 1 ? urls[0] : '';
+    var payload = {
+      media_type: imageUrl ? 'IMAGE' : 'TEXT',
+      text: text,
+    };
+    if (imageUrl) payload.image_url = imageUrl;
+    if (replyToId) payload.reply_to_id = replyToId;
 
-  if (imageUrl) Utilities.sleep(3000);
+    // Step1: コンテナ作成
+    created = apiPost_(c.userId + '/threads', payload);
+    if (imageUrl) Utilities.sleep(3000);
+  }
 
   // Step2: 公開
   var published = apiPost_(c.userId + '/threads_publish', { creation_id: created.id });
@@ -632,6 +724,38 @@ function waitForReady_(containerId) {
   Utilities.sleep(buffer);
 }
 
+function isReplyPropagationError_(msg) {
+  var s = String(msg || '').toLowerCase();
+  return s.indexOf('requested resource does not exist') !== -1 ||
+    s.indexOf('code:24') !== -1 ||
+    s.indexOf('code: 24') !== -1;
+}
+
+function beginnerReplyPropagationMessage_(msg) {
+  return 'Threads側で直前の投稿がまだ反映されていなかったため、続きの投稿に失敗しました。' +
+    '時間を置いて、Webアプリのエラー画面から「失敗分だけ再試行」してください。' +
+    '詳細: ' + maskToken_(msg);
+}
+
+function waitForReplyTargetReady_(postId, maxWaitMs) {
+  if (!postId) return true;
+  var started = new Date().getTime();
+  var interval = 10000;
+  while (new Date().getTime() - started < maxWaitMs) {
+    try {
+      var data = apiGet_(String(postId), { fields: 'id,permalink' });
+      if (data && data.id) return true;
+    } catch (e) {
+      if (!isReplyPropagationError_(e.message)) {
+        console.log('返信先投稿の確認エラー: ' + e.message);
+        return false;
+      }
+    }
+    Utilities.sleep(interval);
+  }
+  return false;
+}
+
 /**
  * リトライ付き投稿（一時的なAPI障害に対応）
  * "The requested resource does not exist" 等のエラーを最大3回リトライ
@@ -641,26 +765,35 @@ function waitForReady_(containerId) {
  * @return {object} { id, containerId }
  */
 function postWithRetry_(text, imageUrl, replyToId) {
-  var MAX_RETRIES = 3;
+  var waits = replyToId ? [30000, 60000, 120000] : [5000, 10000];
+  var maxAttempts = waits.length + 1;
   var lastErr;
 
-  for (var attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+  if (replyToId) {
+    waitForReplyTargetReady_(replyToId, 30000);
+  }
+
+  for (var attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return postToThreads_(text, imageUrl, replyToId);
     } catch (e) {
       lastErr = e;
-      console.log('投稿リトライ ' + attempt + '/' + MAX_RETRIES + ': ' + e.message);
+      console.log('投稿リトライ ' + attempt + '/' + maxAttempts + ': ' + e.message);
 
-      if (attempt < MAX_RETRIES) {
-        // 指数バックオフ: 5秒, 10秒, (15秒)
-        var wait = attempt * 5000;
+      if (attempt < maxAttempts) {
+        var wait = waits[attempt - 1];
         console.log(wait / 1000 + '秒待機後にリトライ...');
         Utilities.sleep(wait);
       }
     }
   }
   // 全リトライ失敗 → エラーメッセージにリトライ回数を付記
-  throw new Error(lastErr.message + '（' + MAX_RETRIES + '回リトライ失敗）');
+  var retries = maxAttempts - 1;
+  var lastMsg = lastErr && lastErr.message ? lastErr.message : String(lastErr);
+  if (replyToId && isReplyPropagationError_(lastMsg)) {
+    throw new Error(beginnerReplyPropagationMessage_(lastMsg) + '（' + retries + '回リトライ失敗）');
+  }
+  throw new Error(lastMsg + '（' + retries + '回リトライ失敗）');
 }
 
 /** 投稿IDからpermalinkを取得 */
@@ -711,7 +844,7 @@ function postSelectedRow() {
 
   try {
     var result = postToThreads_(d.text, '', null);
-    writeSuccess_(sheet, row, result.id);
+    markPostSuccessAfterPublish_(sheet, row, result.id);
     ui.alert('投稿完了！');
   } catch (e) {
     writeError_(sheet, row, e.message);
@@ -783,7 +916,7 @@ function postSelectedThread() {
     try {
       var replyTo = prevPostId ? String(prevPostId) : null;
       var result = postWithRetry_(tr.text, '', replyTo);
-      writeSuccess_(sheet, tr.row, result.id);
+      markPostSuccessAfterPublish_(sheet, tr.row, result.id);
 
       // 次の投稿はこの投稿への返信にする（チェーン）
       prevPostId = String(result.id);
@@ -796,6 +929,12 @@ function postSelectedThread() {
     } catch (e) {
       writeError_(sheet, tr.row, e.message);
       ngCount++;
+      for (var rest = j + 1; rest < threadRows.length; rest++) {
+        if (threadRows[rest].status !== '投稿済') {
+          writeError_(sheet, threadRows[rest].row, '前の投稿が失敗したため、続きの投稿を停止しました。Webアプリのエラー画面から「失敗分だけ再試行」してください。');
+          ngCount++;
+        }
+      }
       // スレッドのチェーンが切れるため残りは中断
       ui.alert('スレッド投稿中にエラー（リトライ後も失敗）:\n' + e.message + '\n\n残り ' + (threadRows.length - j - 1) + ' 件は中断しました。');
       return;
@@ -809,9 +948,13 @@ function postSelectedThread() {
 
 /** 予約投稿（トリガーから自動実行） */
 function processScheduledPosts() {
+  var runProps = PropertiesService.getScriptProperties();
+  runProps.setProperty('LAST_PROCESS_ATTEMPT_AT', new Date().toISOString());
   // 二重実行防止: 前のトリガーがまだ実行中なら即スキップ
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
+    runProps.setProperty('LAST_PROCESS_SKIPPED_AT', new Date().toISOString());
+    runProps.setProperty('LAST_PROCESS_SUMMARY', '別のトリガーが実行中のためスキップ');
     console.log('別のトリガーが実行中のためスキップ');
     return;
   }
@@ -832,6 +975,10 @@ function processScheduledPosts() {
   var lastRow = sheet.getLastRow();
   if (lastRow <= 1) return;
 
+  // 前回「Threads投稿は成功したが、スプシ記録だけ失敗した」行があれば先に復旧する。
+  // 復旧できない場合も、その行は投稿済み扱いでスキップし、二重投稿を防ぐ。
+  recoverPendingSuccesses_(sheet);
+
   // 連携拡張カラム(N,O)も含めて読む（v3互換のため getLastColumn で物理範囲を尊重）
   var readCols = Math.max(TOTAL_COLS, Math.min(sheet.getLastColumn(), TOTAL_COLS_V2));
   var allData = sheet.getRange(2, 1, lastRow - 1, readCols).getValues();
@@ -846,6 +993,14 @@ function processScheduledPosts() {
         var dt = doneAt instanceof Date ? doneAt : new Date(doneAt);
         if (!lastPostedAt || dt.getTime() > lastPostedAt.getTime()) lastPostedAt = dt;
       }
+    }
+  }
+  var pendingForInterval = listPendingSuccesses_();
+  for (var pp = 0; pp < pendingForInterval.length; pp++) {
+    if (!pendingForInterval[pp].postedAt) continue;
+    var pendingDt = new Date(pendingForInterval[pp].postedAt);
+    if (!isNaN(pendingDt.getTime()) && (!lastPostedAt || pendingDt.getTime() > lastPostedAt.getTime())) {
+      lastPostedAt = pendingDt;
     }
   }
   if (lastPostedAt) {
@@ -865,21 +1020,27 @@ function processScheduledPosts() {
     var text = allData[i][COL.TEXT - 1];
     var date = allData[i][COL.DATE - 1];
     if (status !== '待機中' || !text || !date) continue;
+    if (hasPendingSuccess_(i + 2, allData[i][COL.WEB_POST_ID - 1])) {
+      console.log('投稿成功記録の復旧待ちのため再投稿をスキップ: 行' + (i + 2));
+      continue;
+    }
 
     var h = parseInt(allData[i][COL.HOUR - 1], 10) || 0;
     var m = parseInt(allData[i][COL.MINUTE - 1], 10) || 0;
     var scheduled = new Date(date);
     scheduled.setHours(h, m, 0, 0);
     if (scheduled > now) continue;
-    // 5分以上前の予約は投稿しない（列ずれ等で過去日付が大量投稿されるのを防止）。
-    // Web連携行はエラー化して pullResults でWeb側へ返す。待機中のまま残すと永久停止に見えるため。
+    // 予約時刻の分を過ぎた投稿は自動投稿しない。
+    // 10:00予約は10:00台だけ許可し、10:01以降はキューに残してWeb側で時刻変更してもらう。
     var delayMs = now.getTime() - scheduled.getTime();
-    if (delayMs > 5 * 60 * 1000) {
-      var delayMsg = '予約時刻を5分以上過ぎたため投稿をスキップしました（GASトリガー停止/遅延の可能性）。予約=' + Utilities.formatDate(scheduled, 'Asia/Tokyo', 'MM/dd HH:mm') + ' 遅延=' + Math.round(delayMs / 60000) + '分';
-      console.log('スキップ(5分超過): 行' + (i + 2) + ' ' + delayMsg);
-      if (allData[i][COL.WEB_POST_ID - 1]) {
-        writeError_(sheet, i + 2, delayMsg);
-      }
+    var webPostId = allData[i][COL.WEB_POST_ID - 1];
+    if (delayMs >= PAST_DUE_GRACE_MIN * 60 * 1000) {
+      var delayMsg = '予約時刻を' + PAST_DUE_GRACE_MIN + '分以上過ぎたため自動投稿を止めています。必要ならWebアプリのキュー画面で「時刻変更」してください。予約=' + Utilities.formatDate(scheduled, 'Asia/Tokyo', 'MM/dd HH:mm') + ' 遅延=' + Math.round(delayMs / 60000) + '分';
+      console.log('スキップ(期限超過): 行' + (i + 2) + ' ' + delayMsg);
+      // メモ列だけでなく status も「エラー」に切り替える。これで次回 pullResults が WebUI 側へ
+      // 「error」として通知し、ユーザーがエラータブで気付ける。旧実装は status を「待機中」のまま放置していたため、
+      // WebUI 側 DB が永遠に queued のままになり、ユーザーが気付けない不整合があった。
+      writeError_(sheet, i + 2, delayMsg);
       continue;
     }
 
@@ -889,6 +1050,7 @@ function processScheduledPosts() {
       text: text,
       groupNo: groupNo,
       date: date,
+      media: allData[i][COL.MEDIA - 1], // P列: 添付メディアURL(JSON配列)。空ならテキスト投稿
     };
 
     if (!groupNo && groupNo !== 0) {
@@ -919,8 +1081,8 @@ function processScheduledPosts() {
   if (item && item.kind === 'single') {
     var s = item.single;
     try {
-      var singleResult = postWithRetry_(s.text, '', null);
-      writeSuccess_(sheet, s.row, singleResult.id);
+      var singleResult = postWithRetry_(s.text, s.media, null);
+      markPostSuccessAfterPublish_(sheet, s.row, singleResult.id);
       ok++;
     } catch (e) {
       writeError_(sheet, s.row, e.message);
@@ -930,11 +1092,12 @@ function processScheduledPosts() {
     var group = threads[item.threadKey];
     var prevId = null;
     var gNo = group[0].groupNo;
-    var gDate = group[0].date;
 
-    // 同じグループNo＋同じ日付の既投稿から最後の投稿IDを探す（チェーンの続き）
+    // 同じグループNoの既投稿から最後の投稿IDを探す（チェーンの続き／日付不問）
+    // 旧: 同一日付条件があったが、深夜帯の再試行で翌日に押し出されるとスレッドが分断されるため撤去。
+    // ローカル投稿側（scheduler.ts）の挙動と統一。スプシは1スプシ=1Threadsアカウントなのでアカウント分離は構造的に担保。
     for (var k = 0; k < allData.length; k++) {
-      if (allData[k][COL.GROUP - 1] == gNo && isSameDate_(allData[k][COL.DATE - 1], gDate) && allData[k][COL.STATUS - 1] === '投稿済' && allData[k][COL.POST_ID - 1]) {
+      if (allData[k][COL.GROUP - 1] == gNo && allData[k][COL.STATUS - 1] === '投稿済' && allData[k][COL.POST_ID - 1]) {
         prevId = String(allData[k][COL.POST_ID - 1]);
       }
     }
@@ -943,15 +1106,23 @@ function processScheduledPosts() {
       var g = group[gi];
       try {
         var reply = prevId ? String(prevId) : null;
-        var r = postWithRetry_(g.text, '', reply);
-        writeSuccess_(sheet, g.row, r.id);
+        var r = postWithRetry_(g.text, g.media, reply);
+        markPostSuccessAfterPublish_(sheet, g.row, r.id);
         prevId = String(r.id);
         ok++;
         // 次の投稿がある場合、公開完了を待ってから進む
         if (gi < group.length - 1) {
           waitForReady_(r.containerId);
         }
-      } catch (e) { writeError_(sheet, g.row, e.message); ng++; break; }
+      } catch (e) {
+        writeError_(sheet, g.row, e.message);
+        ng++;
+        for (var restGi = gi + 1; restGi < group.length; restGi++) {
+          writeError_(sheet, group[restGi].row, '前の投稿が失敗したため、続きの投稿を停止しました。Webアプリのエラー画面から「失敗分だけ再試行」してください。');
+          ng++;
+        }
+        break;
+      }
     }
   }
 
@@ -960,10 +1131,19 @@ function processScheduledPosts() {
   }
 
   if (ok > 0 || ng > 0) console.log('予約投稿: ' + ok + '件成功, ' + ng + '件エラー');
+  runProps.setProperty('LAST_PROCESS_FINISH_AT', new Date().toISOString());
+  runProps.setProperty('LAST_PROCESS_SUMMARY', '予約投稿: ' + ok + '件成功, ' + ng + '件エラー / 対象予約グループ=' + workItems.length);
+  runProps.deleteProperty('LAST_PROCESS_ERROR');
+  runProps.deleteProperty('LAST_PROCESS_ERROR_AT');
 
   // 1日1回: 古い完了行（Web側にack済み・30日以上前の「投稿済」「エラー」）を削除してスプシ肥大化を防ぐ
   maybeArchiveOldRows_(sheet);
 
+  } catch (e) {
+    var errMsg = maskToken_(e && e.message ? e.message : e);
+    runProps.setProperty('LAST_PROCESS_ERROR_AT', new Date().toISOString());
+    runProps.setProperty('LAST_PROCESS_ERROR', errMsg);
+    console.error('processScheduledPosts エラー: ' + errMsg);
   } finally {
     lock.releaseLock();
   }
@@ -1139,6 +1319,262 @@ function ensureWebColumnsHeader_(sheet) {
   if (lastCol < COL.SYNCED) {
     sheet.getRange(1, COL.SYNCED).setValue('Web取込済');
   }
+  if (lastCol < COL.MEDIA) {
+    sheet.getRange(1, COL.MEDIA).setValue('メディア');
+  }
+}
+
+function pendingSuccessKey_(webPostId, row) {
+  if (webPostId) return PENDING_SUCCESS_PREFIX + 'WEB_' + String(webPostId);
+  return PENDING_SUCCESS_PREFIX + 'ROW_' + String(row);
+}
+
+function listPendingSuccesses_() {
+  var props = PropertiesService.getScriptProperties();
+  var all = props.getProperties();
+  var out = [];
+  var nowMs = new Date().getTime();
+  var ttlMs = PENDING_SUCCESS_TTL_DAYS * 24 * 60 * 60 * 1000;
+  Object.keys(all).forEach(function(key) {
+    if (key.indexOf(PENDING_SUCCESS_PREFIX) !== 0) return;
+    try {
+      var item = JSON.parse(all[key]);
+      item.key = key;
+      var postedMs = item.postedAt ? new Date(item.postedAt).getTime() : 0;
+      if (postedMs && nowMs - postedMs > ttlMs) {
+        props.deleteProperty(key);
+        return;
+      }
+      out.push(item);
+    } catch (e) {
+      props.deleteProperty(key);
+    }
+  });
+  return out;
+}
+
+function getWebPostIdForRow_(sheet, row) {
+  try {
+    if (!sheet || sheet.getLastColumn() < COL.WEB_POST_ID) return '';
+    return String(sheet.getRange(row, COL.WEB_POST_ID).getValue() || '');
+  } catch (e) {
+    return '';
+  }
+}
+
+function diagnoseScheduler_(sheet) {
+  var now = new Date();
+  var props = PropertiesService.getScriptProperties();
+  var result = {
+    version: GAS_VERSION,
+    nowJst: Utilities.formatDate(now, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
+    configured: isConfigured_(),
+    scriptTimeZone: Session.getScriptTimeZone(),
+    spreadsheetTimeZone: SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(),
+    hasSheet: !!sheet,
+    hasTrigger: hasTrigger_('processScheduledPosts'),
+    hasTokenRefreshTrigger: hasTrigger_('refreshAccessToken'),
+    lastRow: sheet ? sheet.getLastRow() : 0,
+    lastColumn: sheet ? sheet.getLastColumn() : 0,
+    lastPostedAtJst: null,
+    intervalBlocked: false,
+    intervalMinutesLeft: 0,
+    pendingSuccessCount: 0,
+    triggerResetAt: props.getProperty('TRIGGER_RESET_AT') || null,
+    lastProcessAttemptAt: props.getProperty('LAST_PROCESS_ATTEMPT_AT') || null,
+    lastProcessFinishAt: props.getProperty('LAST_PROCESS_FINISH_AT') || null,
+    lastProcessSkippedAt: props.getProperty('LAST_PROCESS_SKIPPED_AT') || null,
+    lastProcessSummary: props.getProperty('LAST_PROCESS_SUMMARY') || null,
+    lastProcessErrorAt: props.getProperty('LAST_PROCESS_ERROR_AT') || null,
+    lastProcessError: props.getProperty('LAST_PROCESS_ERROR') || null,
+    dueCount: 0,
+    dueGroups: [],
+    rows: []
+  };
+  if (!sheet || result.lastRow <= 1) return result;
+
+  var readCols = Math.max(TOTAL_COLS, Math.min(sheet.getLastColumn(), TOTAL_COLS_V2));
+  var allData = sheet.getRange(2, 1, result.lastRow - 1, readCols).getValues();
+
+  var lastPostedAt = null;
+  for (var p = 0; p < allData.length; p++) {
+    if (allData[p][COL.STATUS - 1] === '投稿済') {
+      var doneAt = allData[p][COL.DONE_AT - 1];
+      if (doneAt) {
+        var dt = doneAt instanceof Date ? doneAt : new Date(doneAt);
+        if (!isNaN(dt.getTime()) && (!lastPostedAt || dt.getTime() > lastPostedAt.getTime())) {
+          lastPostedAt = dt;
+        }
+      }
+    }
+  }
+  var pending = listPendingSuccesses_();
+  result.pendingSuccessCount = pending.length;
+  for (var pp = 0; pp < pending.length; pp++) {
+    if (!pending[pp].postedAt) continue;
+    var pendingDt = new Date(pending[pp].postedAt);
+    if (!isNaN(pendingDt.getTime()) && (!lastPostedAt || pendingDt.getTime() > lastPostedAt.getTime())) {
+      lastPostedAt = pendingDt;
+    }
+  }
+  if (lastPostedAt) {
+    result.lastPostedAtJst = Utilities.formatDate(lastPostedAt, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+    var sinceMs = now.getTime() - lastPostedAt.getTime();
+    if (sinceMs < POST_INTERVAL_MIN * 60 * 1000) {
+      result.intervalBlocked = true;
+      result.intervalMinutesLeft = Math.ceil((POST_INTERVAL_MIN * 60 * 1000 - sinceMs) / 60000);
+    }
+  }
+
+  var dueGroupMap = {};
+  for (var i = 0; i < allData.length; i++) {
+    var status = allData[i][COL.STATUS - 1];
+    var text = allData[i][COL.TEXT - 1];
+    var date = allData[i][COL.DATE - 1];
+    var webPostId = allData[i][COL.WEB_POST_ID - 1];
+    var h = parseInt(allData[i][COL.HOUR - 1], 10) || 0;
+    var m = parseInt(allData[i][COL.MINUTE - 1], 10) || 0;
+    var scheduled = date ? new Date(date) : null;
+    if (scheduled) scheduled.setHours(h, m, 0, 0);
+    var delayMs = scheduled ? now.getTime() - scheduled.getTime() : null;
+    var rowInfo = {
+      row: i + 2,
+      webPostId: webPostId ? String(webPostId) : '',
+      groupNo: allData[i][COL.GROUP - 1],
+      type: String(allData[i][COL.TYPE - 1] || ''),
+      status: String(status || ''),
+      textLength: text ? String(text).length : 0,
+      scheduledJst: scheduled ? Utilities.formatDate(scheduled, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') : null,
+      delayMinutes: delayMs == null ? null : Math.floor(delayMs / 60000),
+      maxOverdueMinutes: PAST_DUE_GRACE_MIN,
+      due: false,
+      reason: ''
+    };
+    if (status !== '待機中') {
+      rowInfo.reason = '対象外: ステータスが待機中ではありません';
+    } else if (!text) {
+      rowInfo.reason = '対象外: 投稿文が空です';
+    } else if (!date) {
+      rowInfo.reason = '対象外: 予約日が空です';
+    } else if (hasPendingSuccess_(i + 2, webPostId)) {
+      rowInfo.reason = '対象外: 投稿成功記録の復旧待ちです';
+    } else if (scheduled > now) {
+      rowInfo.reason = '対象外: まだ予約時刻前です';
+    } else if (delayMs >= PAST_DUE_GRACE_MIN * 60 * 1000) {
+      rowInfo.reason = '対象外: 予約時刻を過ぎたため自動投稿しません';
+    } else if (result.intervalBlocked) {
+      rowInfo.reason = '待機: 直近投稿から60分以内の安全間隔です';
+    } else {
+      rowInfo.due = true;
+      rowInfo.reason = '投稿対象です';
+      var groupNo = allData[i][COL.GROUP - 1];
+      var groupKey = (!groupNo && groupNo !== 0) ? 'single_row_' + (i + 2) : String(groupNo) + '_' + dateKey_(date);
+      dueGroupMap[groupKey] = true;
+    }
+    if (status === '待機中' || webPostId || status === '投稿済' || status === 'エラー') {
+      result.rows.push(rowInfo);
+    }
+  }
+  result.dueGroups = Object.keys(dueGroupMap);
+  result.dueCount = result.dueGroups.length;
+  return result;
+}
+
+function savePendingSuccess_(sheet, row, postId, postUrl, reason) {
+  var props = PropertiesService.getScriptProperties();
+  var webPostId = getWebPostIdForRow_(sheet, row);
+  var payload = {
+    row: row,
+    webPostId: webPostId || null,
+    postId: String(postId),
+    postUrl: postUrl || '',
+    postedAt: new Date().toISOString(),
+    reason: maskToken_(reason || 'spreadsheet write failed'),
+  };
+  props.setProperty(pendingSuccessKey_(webPostId, row), JSON.stringify(payload));
+  console.error('Threads投稿は成功しましたが、スプシ記録に失敗しました。二重投稿防止のため成功メモを保存: row=' + row + ' postId=' + postId);
+}
+
+function hasPendingSuccess_(row, webPostId) {
+  var pending = listPendingSuccesses_();
+  var targetWebId = webPostId ? String(webPostId) : '';
+  for (var i = 0; i < pending.length; i++) {
+    if (targetWebId && pending[i].webPostId && String(pending[i].webPostId) === targetWebId) return true;
+    if (Number(pending[i].row) === Number(row)) return true;
+  }
+  return false;
+}
+
+function retrySheetWrite_(label, fn) {
+  var lastErr = null;
+  for (var i = 0; i < 3; i++) {
+    try {
+      return fn();
+    } catch (e) {
+      lastErr = e;
+      console.log(label + ' リトライ ' + (i + 1) + '/3: ' + (e && e.message ? e.message : e));
+      Utilities.sleep((i + 1) * 700);
+    }
+  }
+  throw lastErr;
+}
+
+function recoverPendingSuccesses_(sheet) {
+  var props = PropertiesService.getScriptProperties();
+  var pending = listPendingSuccesses_();
+  for (var i = 0; i < pending.length; i++) {
+    var item = pending[i];
+    var row = -1;
+    if (item.webPostId) row = findRowByWebPostId_(sheet, item.webPostId);
+    if (row <= 0 && item.row) row = Number(item.row);
+    if (!row || row <= 1 || row > sheet.getLastRow()) continue;
+
+    try {
+      var currentStatus = sheet.getRange(row, COL.STATUS).getValue();
+      if (currentStatus === '投稿済') {
+        props.deleteProperty(item.key);
+        continue;
+      }
+      writeSuccess_(sheet, row, item.postId, item.postUrl || '');
+      props.deleteProperty(item.key);
+      console.log('投稿成功記録を復旧しました: row=' + row + ' postId=' + item.postId);
+    } catch (e) {
+      console.error('投稿成功記録の復旧に失敗: row=' + row + ' postId=' + item.postId + ' ' + (e && e.message ? e.message : e));
+    }
+  }
+}
+
+function markPendingSuccessAcked_(webPostId) {
+  if (!webPostId) return false;
+  var props = PropertiesService.getScriptProperties();
+  var pending = listPendingSuccesses_();
+  for (var i = 0; i < pending.length; i++) {
+    if (pending[i].webPostId && String(pending[i].webPostId) === String(webPostId)) {
+      pending[i].ackedAt = new Date().toISOString();
+      props.setProperty(pending[i].key, JSON.stringify(pending[i]));
+      return true;
+    }
+  }
+  return false;
+}
+
+function markPostSuccessAfterPublish_(sheet, row, postId) {
+  var postUrl = getPostPermalink_(postId);
+  try {
+    writeSuccess_(sheet, row, postId, postUrl);
+    PropertiesService.getScriptProperties().deleteProperty(pendingSuccessKey_(getWebPostIdForRow_(sheet, row), row));
+  } catch (e) {
+    try {
+      savePendingSuccess_(sheet, row, postId, postUrl, e && e.message ? e.message : String(e));
+    } catch (pendingErr) {
+      try {
+        writeError_(sheet, row, 'Threads投稿は成功しましたが、スプレッドシートへの記録に失敗しました。再投稿しないでください。投稿ID=' + postId);
+      } catch (ignored) {
+        // ここまで失敗した場合のみ、次回の自動復旧材料が残らない。ログに残して調査対象にする。
+      }
+      throw pendingErr;
+    }
+  }
 }
 
 function getPostSheet_() {
@@ -1153,20 +1589,24 @@ function checkConfig_(ui) {
 }
 
 /** 投稿成功をバッチ書き込み */
-function writeSuccess_(sheet, row, postId) {
-  var permalink = getPostPermalink_(postId);
-  // postIdセルをテキスト形式にしてから書き込み（数値化による精度劣化を防止）
-  sheet.getRange(row, COL.POST_ID).setNumberFormat('@');
-  // STATUS(H), POST_ID(I), DONE_AT(J), POST_URL(K) の4列を一括書き込み
-  sheet.getRange(row, COL.STATUS, 1, 4).setValues([
-    ['投稿済', String(postId), new Date(), permalink || '']
-  ]);
+function writeSuccess_(sheet, row, postId, postUrl) {
+  var permalink = (postUrl !== undefined && postUrl !== null) ? postUrl : getPostPermalink_(postId);
+  retrySheetWrite_('投稿成功記録', function() {
+    // postIdセルをテキスト形式にしてから書き込み（数値化による精度劣化を防止）
+    sheet.getRange(row, COL.POST_ID).setNumberFormat('@');
+    // STATUS(H), POST_ID(I), DONE_AT(J), POST_URL(K) の4列を一括書き込み
+    sheet.getRange(row, COL.STATUS, 1, 4).setValues([
+      ['投稿済', String(postId), new Date(), permalink || '']
+    ]);
+  });
 }
 
 function writeError_(sheet, row, msg) {
   var now = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MM/dd HH:mm');
-  sheet.getRange(row, COL.STATUS).setValue('エラー');
-  sheet.getRange(row, COL.ERROR).setValue('[' + now + '] ' + maskToken_(msg));
+  retrySheetWrite_('エラー記録', function() {
+    sheet.getRange(row, COL.STATUS).setValue('エラー');
+    sheet.getRange(row, COL.ERROR).setValue('[' + now + '] ' + maskToken_(msg));
+  });
 }
 
 // ============================================
@@ -1424,6 +1864,15 @@ function hasTrigger_(handlerName) {
   return false;
 }
 
+function deleteAutomationTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    var fn = t.getHandlerFunction();
+    if (fn === 'processScheduledPosts' || fn === 'refreshAccessToken' || fn === 'watchdog') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
 /** 投稿実行トリガー（processScheduledPosts, 毎分）が無ければ作る。UIなし。作ったら true */
 function ensureMainTrigger_() {
   if (hasTrigger_('processScheduledPosts')) return false;
@@ -1453,10 +1902,19 @@ function ensureAllTriggers_() {
   ensureWatchdog_();
 }
 
+/** クラウド修復時は既存トリガーが見えていても死んでいる可能性があるため、必ず作り直す */
+function resetAllTriggers_() {
+  deleteAutomationTriggers_();
+  ScriptApp.newTrigger('processScheduledPosts').timeBased().everyMinutes(1).create();
+  ScriptApp.newTrigger('refreshAccessToken').timeBased().everyDays(1).create();
+  ScriptApp.newTrigger('watchdog').timeBased().everyHours(6).create();
+  PropertiesService.getScriptProperties().setProperty('TRIGGER_RESET_AT', new Date().toISOString());
+  try { var sh = getPostSheet_(); if (sh) sh.setTabColor('#4ade80'); } catch (e) {}
+}
+
 function setupTrigger() {
   if (!isConfigured_()) { SpreadsheetApp.getUi().alert('先にAPI設定を行ってください。'); return; }
-  removeTrigger();
-  ensureAllTriggers_();
+  resetAllTriggers_();
   // シートタブを緑に（ON状態を視覚化）
   var sheet = getPostSheet_();
   if (sheet) sheet.setTabColor('#4ade80');
@@ -1465,12 +1923,7 @@ function setupTrigger() {
 
 function removeTrigger() {
   // watchdog も一緒に消す（残すと watchdog が processScheduledPosts を自動復活させて OFF が効かない）
-  ScriptApp.getProjectTriggers().forEach(function(t) {
-    var fn = t.getHandlerFunction();
-    if (fn === 'processScheduledPosts' || fn === 'refreshAccessToken' || fn === 'watchdog') {
-      ScriptApp.deleteTrigger(t);
-    }
-  });
+  deleteAutomationTriggers_();
   // シートタブを赤に（OFF状態を視覚化）
   var sheet = getPostSheet_();
   if (sheet) sheet.setTabColor('#f87171');
@@ -1732,21 +2185,40 @@ function watchdog() {
     issues.push('投稿予定時刻を3時間以上過ぎた待機中が ' + overdueCount + ' 件あります。');
   }
 
-  // 問題があればメール送信
+  // 問題があれば(1) Properties に最新issuesを保存（WebUI 側 pullResults などで取り出し可能） →
+  // (2) メール送信を試みる。Session.getActiveUser は userinfo.email スコープが未許可だと throw するため、
+  // 権限不足時もメール失敗だけで watchdog 全体は落とさない（issues は Properties に残るので可視性は保つ）。
   if (issues.length > 0) {
-    var email = Session.getActiveUser().getEmail();
-    var ssUrl = SpreadsheetApp.getActiveSpreadsheet().getUrl();
-    var subject = '【自動投稿】異常検知アラート';
-    var body = '自動投稿システムで問題が検出されました。\n\n' +
-      issues.join('\n') +
-      '\n\n■ 対処方法\n' +
-      '1. スプレッドシートを開く: ' + ssUrl + '\n' +
-      '2.「自動投稿」メニュー →「トリガー ON（1分間隔）」で再設定\n' +
-      '3. 必要に応じて「日付リスケ」で日程を調整\n\n' +
-      '検知時刻: ' + Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyy/MM/dd HH:mm');
-
-    MailApp.sendEmail(email, subject, body);
-    Logger.log('アラートメール送信: ' + email + ' / ' + issues.join(', '));
+    try {
+      props.setProperty('LAST_WATCHDOG_ISSUES', JSON.stringify({
+        at: now.toISOString(),
+        issues: issues,
+      }));
+    } catch (e) {
+      Logger.log('LAST_WATCHDOG_ISSUES 保存失敗: ' + (e && e.message));
+    }
+    try {
+      var email = Session.getActiveUser().getEmail();
+      if (email) {
+        var ssUrl = SpreadsheetApp.getActiveSpreadsheet().getUrl();
+        var subject = '【自動投稿】異常検知アラート';
+        var body = '自動投稿システムで問題が検出されました。\n\n' +
+          issues.join('\n') +
+          '\n\n■ 対処方法\n' +
+          '1. スプレッドシートを開く: ' + ssUrl + '\n' +
+          '2.「自動投稿」メニュー →「トリガー ON（1分間隔）」で再設定\n' +
+          '3. 必要に応じて「日付リスケ」で日程を調整\n\n' +
+          '検知時刻: ' + Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyy/MM/dd HH:mm');
+        MailApp.sendEmail(email, subject, body);
+        Logger.log('アラートメール送信: ' + email + ' / ' + issues.join(', '));
+      } else {
+        Logger.log('アラートメール送信スキップ（メールアドレス取得不可）: ' + issues.join(', '));
+      }
+    } catch (e) {
+      // 権限不足や送信失敗時は Logger に残して継続。Properties の LAST_WATCHDOG_ISSUES から
+      // WebUI 側でも検知可能なので、watchdog 全体は健全終了させる。
+      Logger.log('アラートメール送信失敗（権限不足の可能性）: ' + (e && e.message) + ' / issues=' + issues.join(', '));
+    }
   } else {
     Logger.log('ウォッチドッグ: 異常なし');
   }
@@ -1891,6 +2363,88 @@ function doPost(e) {
 
     // --- アクション処理 ---
 
+    // uploadMedia: 画像をDriveに保存して公開直リンクを返す（webappの画像添付用）
+    // body: { base64, mimeType, fileName, webPostId? }
+    if (body.action === 'uploadMedia') {
+      if (!body.base64 || !body.mimeType) {
+        return ContentService.createTextOutput(JSON.stringify({
+          status: 'error', message: 'base64 と mimeType が必要です'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        var mediaBytes = Utilities.base64Decode(body.base64);
+        var mediaName = body.fileName || ('media_' + new Date().getTime());
+        var mediaBlob = Utilities.newBlob(mediaBytes, body.mimeType, mediaName);
+        var mediaFolder = getOrCreateMediaFolder_();
+        var mediaFile = mediaFolder.createFile(mediaBlob);
+        mediaFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        var mediaFileId = mediaFile.getId();
+        return ContentService.createTextOutput(JSON.stringify({
+          status: 'ok',
+          driveFileId: mediaFileId,
+          // Threads が fetch 可能な画像直リンク（googleusercontent CDN）
+          publicUrl: 'https://lh3.googleusercontent.com/d/' + mediaFileId,
+          altUrl: 'https://drive.google.com/uc?export=view&id=' + mediaFileId
+        })).setMimeType(ContentService.MimeType.JSON);
+      } catch (mediaErr) {
+        return ContentService.createTextOutput(JSON.stringify({
+          status: 'error', message: '画像のアップロードに失敗しました: ' + mediaErr.message
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // deleteMedia: 指定したDriveメディアをゴミ箱へ（webappの画像×削除/投稿削除時のクリーンアップ用）
+    // body: { fileIds: [...] }  ※ゴミ箱なので30日間は復元可能
+    if (body.action === 'deleteMedia') {
+      var delIds = body.fileIds || (body.driveFileId ? [body.driveFileId] : []);
+      var delTrashed = 0;
+      var delFailed = [];
+      for (var di = 0; di < delIds.length; di++) {
+        var fid = delIds[di];
+        if (!fid) continue;
+        try {
+          DriveApp.getFileById(fid).setTrashed(true);
+          delTrashed++;
+        } catch (delErr) {
+          delFailed.push(String(fid)); // 既に消えている等は無視
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({
+        status: 'ok', trashed: delTrashed, failed: delFailed
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // pruneMedia: メディアフォルダ内で keepIds に無いファイル（＝どの投稿にも紐づかない孤立画像）をゴミ箱へ
+    // body: { keepIds: [...] }  ※既存の溜まり分を一掃する手動整理用
+    if (body.action === 'pruneMedia') {
+      var keep = {};
+      var keepIds = body.keepIds || [];
+      for (var ki = 0; ki < keepIds.length; ki++) {
+        if (keepIds[ki]) keep[String(keepIds[ki])] = true;
+      }
+      var pruneTrashed = 0;
+      var pruneKept = 0;
+      try {
+        var pruneFolder = getOrCreateMediaFolder_();
+        var files = pruneFolder.getFiles();
+        while (files.hasNext()) {
+          var f = files.next();
+          if (keep[f.getId()]) {
+            pruneKept++;
+          } else {
+            try { f.setTrashed(true); pruneTrashed++; } catch (pErr) { /* skip */ }
+          }
+        }
+      } catch (pruneErr) {
+        return ContentService.createTextOutput(JSON.stringify({
+          status: 'error', message: '画像の整理に失敗しました: ' + pruneErr.message
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      return ContentService.createTextOutput(JSON.stringify({
+        status: 'ok', trashed: pruneTrashed, kept: pruneKept
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
     // setConfig: トークン設定 + USER ID自動取得 + 検証 + シート初期化（一発完結）
     if (body.action === 'setConfig') {
       if (!body.token || String(body.token).length < 10) {
@@ -1971,9 +2525,8 @@ function doPost(e) {
 
       // 必要なトリガーを一括セット（投稿実行=processScheduledPosts 毎分 / トークン更新=refreshAccessToken 1日おき / 監視=watchdog 6時間おき）
       // ※ ここで投稿実行トリガーを作らないと、クラウドオフロードが「有効」でも GAS が一切投稿しない
-      setupTokenRefreshTrigger_();
-      ensureMainTrigger_();
-      ensureWatchdog_();
+      // 既存トリガーが存在しても実際には発火していないことがあるため、クラウド修復時は必ず作り直す
+      resetAllTriggers_();
       refreshAccessToken_(true);
 
       // スクリプトプロジェクトのタイムゾーン（マニフェスト appsscript.json の "timeZone"）
@@ -1998,6 +2551,11 @@ function doPost(e) {
     // healthCheck: Web側からの疎通確認。設定済みかどうかとトリガー有無を返す
     if (body.action === 'healthCheck') {
       var hcConfigured = isConfigured_();
+      if (hcConfigured) {
+        // クラウドオフロードではトリガーが消えている状態が最も危険なので、
+        // Web UIの自動チェックが来た時点で自己修復する。
+        ensureAllTriggers_();
+      }
       var hcTriggers = ScriptApp.getProjectTriggers();
       var hcHasTrigger = hcTriggers.some(function(t) {
         return t.getHandlerFunction() === 'processScheduledPosts';
@@ -2007,6 +2565,7 @@ function doPost(e) {
       });
       var hcCfg = getConfig_();
       var hcTokenState = getTokenState_();
+      var hcProps = PropertiesService.getScriptProperties();
       return ContentService.createTextOutput(JSON.stringify({
         status: 'ok',
         version: GAS_VERSION,
@@ -2019,7 +2578,23 @@ function doPost(e) {
         tokenExpiresAt: hcTokenState.expiresAt,
         tokenLastError: hcTokenState.lastError,
         scriptTimeZone: Session.getScriptTimeZone(),
-        spreadsheetTimeZone: ss.getSpreadsheetTimeZone()
+        spreadsheetTimeZone: ss.getSpreadsheetTimeZone(),
+        triggerResetAt: hcProps.getProperty('TRIGGER_RESET_AT') || null,
+        lastProcessAttemptAt: hcProps.getProperty('LAST_PROCESS_ATTEMPT_AT') || null,
+        lastProcessFinishAt: hcProps.getProperty('LAST_PROCESS_FINISH_AT') || null,
+        lastProcessSkippedAt: hcProps.getProperty('LAST_PROCESS_SKIPPED_AT') || null,
+        lastProcessSummary: hcProps.getProperty('LAST_PROCESS_SUMMARY') || null,
+        lastProcessErrorAt: hcProps.getProperty('LAST_PROCESS_ERROR_AT') || null,
+        lastProcessError: hcProps.getProperty('LAST_PROCESS_ERROR') || null
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // diagnoseScheduler: 投稿は実行せず、時間トリガーが現在の待機行を
+    // 投稿対象として見るか、どの安全弁で待っているかだけ返す。
+    if (body.action === 'diagnoseScheduler') {
+      return ContentService.createTextOutput(JSON.stringify({
+        status: 'ok',
+        diagnostics: diagnoseScheduler_(sheet)
       })).setMimeType(ContentService.MimeType.JSON);
     }
 
@@ -2041,10 +2616,9 @@ function doPost(e) {
       try {
         // シート初期化保証（書式・ヘッダーなし状態でも append できるように）
         ensureWebColumnsHeader_(sheet);
-        // 投稿実行トリガー・監視トリガーが（消えていたら）必ず存在するようにする
-        // ＝ Webから queue を push する度に自己修復。GASコード更新後にトリガーが無い状態でも次の push で復活
-        ensureMainTrigger_();
-        ensureWatchdog_();
+        // 必要トリガーが（消えていたら）必ず存在するようにする
+        // ＝ Webから queue を push する度に自己修復。Google投稿の修復後にトリガーが無い状態でも次の push で復活
+        ensureAllTriggers_();
 
         var pushRows = [];        // 新規 append 用バッファ
         var pushPostIds = [];
@@ -2070,10 +2644,20 @@ function doPost(e) {
           row[COL.MEMO - 1] = pp.memo || 'Web連携';
           row[COL.WEB_POST_ID - 1] = pp.webPostId;
           row[COL.SYNCED - 1] = '';
+          row[COL.MEDIA - 1] = (Array.isArray(pp.imageUrls) && pp.imageUrls.length > 0)
+            ? JSON.stringify(pp.imageUrls)
+            : '';
           // 同じ webPostId の行が既にあれば（＝下書きに戻した行・エラー行が残っている）
           // エラーにせず、その行を上書きして再キュー扱いにする（in-place なので行ずれなし）
           var existingRow = findRowByWebPostId_(sheet, pp.webPostId);
           if (existingRow > 0) {
+            var existingStatus = String(sheet.getRange(existingRow, COL.STATUS).getValue() || '');
+            if (existingStatus === '投稿済') {
+              return ContentService.createTextOutput(JSON.stringify({
+                status: 'error',
+                message: 'この予約はGoogle側では既に投稿済みです。Web画面で「今すぐ同期」を押して投稿結果を取り込んでください。（webPostId=' + pp.webPostId + '）'
+              })).setMimeType(ContentService.MimeType.JSON);
+            }
             sheet.getRange(existingRow, 1, 1, TOTAL_COLS_V2).setValues([row]);
             sheet.getRange(existingRow, COL.POST_ID, 1, 1).setNumberFormat('@');
             sheet.getRange(existingRow, COL.WEB_POST_ID, 1, 1).setNumberFormat('@');
@@ -2105,6 +2689,50 @@ function doPost(e) {
       } finally {
         pqLock.releaseLock();
       }
+    }
+
+    // verifyQueueByPostIds: Web側が「予約済み」と記録する前に、
+    // Googleシート側へ本当に入ったかを確認する。ここで missing があれば
+    // Web側は queued にしない（クラウド予約の空振り防止）。
+    if (body.action === 'verifyQueueByPostIds') {
+      if (!Array.isArray(body.webPostIds) || body.webPostIds.length === 0) {
+        return ContentService.createTextOutput(JSON.stringify({
+          status: 'ok', present: [], missing: [], rows: []
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      ensureWebColumnsHeader_(sheet);
+      var vqLastRow = sheet.getLastRow();
+      var vqIndex = {};
+      if (vqLastRow >= 2 && sheet.getLastColumn() >= COL.WEB_POST_ID) {
+        var vqData = sheet.getRange(2, 1, vqLastRow - 1, TOTAL_COLS_V2).getValues();
+        for (var vqi = 0; vqi < vqData.length; vqi++) {
+          var vqWebId = vqData[vqi][COL.WEB_POST_ID - 1];
+          if (!vqWebId) continue;
+          vqIndex[String(vqWebId)] = {
+            webPostId: String(vqWebId),
+            status: String(vqData[vqi][COL.STATUS - 1] || ''),
+            row: vqi + 2
+          };
+        }
+      }
+      var vqPresent = [];
+      var vqMissing = [];
+      var vqRows = [];
+      for (var vqj = 0; vqj < body.webPostIds.length; vqj++) {
+        var vqTarget = String(body.webPostIds[vqj]);
+        if (vqIndex[vqTarget]) {
+          vqPresent.push(vqTarget);
+          vqRows.push(vqIndex[vqTarget]);
+        } else {
+          vqMissing.push(vqTarget);
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({
+        status: 'ok',
+        present: vqPresent,
+        missing: vqMissing,
+        rows: vqRows
+      })).setMimeType(ContentService.MimeType.JSON);
     }
 
     // updateByPostId: webPostId をキーに行を更新（編集競合対応）
@@ -2163,6 +2791,7 @@ function doPost(e) {
     if (body.action === 'pullResults') {
       var pullSheet = sheet;
       ensureWebColumnsHeader_(pullSheet);
+      recoverPendingSuccesses_(pullSheet);
       var pullLastRow = pullSheet.getLastRow();
       var pullResults = [];
       var pullErrorCount24h = 0;
@@ -2196,6 +2825,20 @@ function doPost(e) {
           });
         }
       }
+      var pendingSuccesses = listPendingSuccesses_();
+      for (var ps = 0; ps < pendingSuccesses.length; ps++) {
+        var pending = pendingSuccesses[ps];
+        if (!pending.webPostId || pending.ackedAt) continue;
+        pullResults.push({
+          webPostId: String(pending.webPostId),
+          status: 'posted',
+          threadsPostId: pending.postId ? String(pending.postId) : null,
+          postUrl: pending.postUrl || null,
+          postedAt: pending.postedAt || null,
+          error: null,
+          row: pending.row || 0,
+        });
+      }
       // トークン状態
       var pullTokenState = getTokenState_();
       return ContentService.createTextOutput(JSON.stringify({
@@ -2225,8 +2868,11 @@ function doPost(e) {
       for (var ai = 0; ai < body.webPostIds.length; ai++) {
         var ackId = body.webPostIds[ai];
         var ackRow = findRowByWebPostId_(sheet, ackId);
+        var ackedPending = markPendingSuccessAcked_(ackId);
         if (ackRow > 0) {
           sheet.getRange(ackRow, COL.SYNCED).setValue('1');
+          ackCount++;
+        } else if (ackedPending) {
           ackCount++;
         } else {
           ackMissing.push(ackId);

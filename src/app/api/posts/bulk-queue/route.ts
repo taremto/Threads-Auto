@@ -1,9 +1,15 @@
 import { prisma } from "@/lib/prisma";
+import { validateObservedThreadsUserId } from "@/lib/account-identity";
 import { NextResponse } from "next/server";
 import {
   endpointFromAccount,
+  gasVersionUpgradeMessage,
+  healthCheck,
+  isGasVersionSupported,
   pushQueue,
+  tokenFingerprintOf,
   toJstString,
+  verifyQueueByPostIds,
   type PushPostInput,
 } from "@/lib/gas-bridge";
 import { applyMinuteJitter, buildJstSlots, selectSafeSlots } from "@/lib/schedule";
@@ -31,6 +37,18 @@ export async function POST(request: Request) {
     if (!account) {
       return NextResponse.json({ error: "account not found" }, { status: 404 });
     }
+    const migrationLock = await prisma.appSetting.findUnique({
+      where: { key: "migrationLock" },
+    });
+    if (migrationLock?.value === "true") {
+      return NextResponse.json(
+        {
+          error:
+            "Google投稿の修復中です。修復が終わってからもう一度キューに追加してください。",
+        },
+        { status: 409 }
+      );
+    }
 
     let postingHours: number[];
     try {
@@ -46,6 +64,9 @@ export async function POST(request: Request) {
     const drafts = await prisma.post.findMany({
       where: { accountId, status: "draft" },
       orderBy: [{ groupNo: "asc" }, { sortOrder: "asc" }],
+      include: {
+        media: { where: { status: "ready" }, orderBy: { sortOrder: "asc" } },
+      },
     });
 
     if (drafts.length === 0) {
@@ -101,6 +122,7 @@ export async function POST(request: Request) {
       postIds: posts.map((p) => p.id),
       publishAt: slots[i],
       preview: posts[0].body.slice(0, 60).replace(/\n/g, " "),
+      recommendedLabel: posts[0].recommendedLabel,
     }));
 
     if (dryRun) {
@@ -112,6 +134,7 @@ export async function POST(request: Request) {
           groupNo: a.groupNo,
           publishAt: a.publishAt.toISOString(),
           preview: a.preview,
+          recommendedLabel: a.recommendedLabel,
         })),
       });
     }
@@ -122,13 +145,80 @@ export async function POST(request: Request) {
       return NextResponse.json(
         {
           error:
-            "クラウドオフロードがONですがGAS Web App URL/Keyが未設定です。設定→クラウドオフロード設定で初期化してください",
+            "クラウド投稿がONですが、Google側の接続情報が見つかりません。設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。",
         },
         { status: 400 }
       );
     }
 
     if (endpoint) {
+      const gasHealth = await healthCheck(endpoint);
+      if (!gasHealth.ok || !gasHealth.data) {
+        return NextResponse.json(
+          {
+            error:
+              "Google側に接続できないため、予約をクラウドへ送れませんでした。ネット接続とクラウドオフロード設定を確認してください。",
+            detail: gasHealth.error,
+            httpStatus: gasHealth.httpStatus,
+          },
+          { status: 502 }
+        );
+      }
+      if (!isGasVersionSupported(gasHealth.data.version)) {
+        return NextResponse.json(
+          { error: gasVersionUpgradeMessage(gasHealth.data.version) },
+          { status: 422 }
+        );
+      }
+      if (!gasHealth.data.configured) {
+        return NextResponse.json(
+          { error: "Google側の初期設定が未完了です。設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。" },
+          { status: 422 }
+        );
+      }
+      if (gasHealth.data.scriptTimeZone && gasHealth.data.scriptTimeZone !== "Asia/Tokyo") {
+        return NextResponse.json(
+          { error: "Google側のタイムゾーンが Asia/Tokyo ではありません。設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。" },
+          { status: 422 }
+        );
+      }
+      if (!gasHealth.data.hasTrigger) {
+        return NextResponse.json(
+          { error: "Google側の自動実行が見つかりません。設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。" },
+          { status: 422 }
+        );
+      }
+      const identityCheck = await validateObservedThreadsUserId(
+        {
+          accountId,
+          accountName: account.name,
+          currentThreadsUserId: account.threadsUserId,
+        },
+        gasHealth.data.userId
+      );
+      if (!identityCheck.ok) {
+        return NextResponse.json(
+          {
+            error: identityCheck.error,
+            expected: {
+              userId: identityCheck.expectedUserId,
+              tokenFingerprint: tokenFingerprintOf(account.accessToken),
+            },
+            observed: {
+              userId: identityCheck.observedUserId,
+              tokenFingerprint: gasHealth.data.tokenFingerprint || null,
+              version: gasHealth.data.version,
+            },
+          },
+          { status: 409 }
+        );
+      }
+      if (identityCheck.shouldBackfill) {
+        await prisma.account.update({
+          where: { id: accountId },
+          data: { threadsUserId: identityCheck.userId },
+        });
+      }
       // postId → publishAt の対応表を作る（同groupは同じpublishAt）
       const publishAtByPostId = new Map<string, Date>();
       for (const a of assignments) {
@@ -137,15 +227,19 @@ export async function POST(request: Request) {
       const groupNoByPostId = new Map<string, number>(
         drafts.map((p) => [p.id, p.groupNo])
       );
-      const postsForGas: PushPostInput[] = drafts.map((d) => ({
-        webPostId: d.id,
-        groupNo: groupNoByPostId.get(d.id) ?? null,
-        text: d.body,
-        postType:
-          d.postType === "thread" ? "thread" : ("standalone" as const),
-        publishAtJst: toJstString(publishAtByPostId.get(d.id)!),
-        memo: d.memo || undefined,
-      }));
+      const postsForGas: PushPostInput[] = drafts.map((d) => {
+        const imageUrls = d.media.map((m) => m.publicUrl).filter(Boolean);
+        return {
+          webPostId: d.id,
+          groupNo: groupNoByPostId.get(d.id) ?? null,
+          text: d.body,
+          postType:
+            d.postType === "thread" ? "thread" : ("standalone" as const),
+          publishAtJst: toJstString(publishAtByPostId.get(d.id)!),
+          memo: d.memo || undefined,
+          ...(imageUrls.length > 0 ? { imageUrls } : {}),
+        };
+      });
 
       const gasResult = await pushQueue(endpoint, postsForGas);
       if (!gasResult.ok) {
@@ -155,6 +249,40 @@ export async function POST(request: Request) {
             httpStatus: gasResult.httpStatus,
           },
           { status: 502 }
+        );
+      }
+      const queueCheck = await verifyQueueByPostIds(
+        endpoint,
+        postsForGas.map((p) => p.webPostId)
+      );
+      if (!queueCheck.ok || !queueCheck.data) {
+        return NextResponse.json(
+          {
+            error:
+              "Google側に予約が入ったか確認できませんでした。Web画面では予約済みにしませんでした。もう一度お試しください。",
+            detail: queueCheck.error,
+          },
+          { status: 502 }
+        );
+      }
+      if (queueCheck.data.missing.length > 0) {
+        return NextResponse.json(
+          {
+            error:
+              "Google側に入っていない予約があります。Web画面では予約済みにしませんでした。もう一度お試しください。",
+            missing: queueCheck.data.missing.length,
+          },
+          { status: 502 }
+        );
+      }
+      const notWaiting = queueCheck.data.rows.filter((r) => r.status !== "待機中");
+      if (notWaiting.length > 0) {
+        return NextResponse.json(
+          {
+            error:
+              "Google側の予約状態が待機中ではありません。重複投稿を避けるため停止しました。今すぐ同期して状態を確認してください。",
+          },
+          { status: 409 }
         );
       }
 

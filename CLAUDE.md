@@ -1,4 +1,4 @@
-# Threads 自動投稿 WebUI — Claude Code 用ガイド
+# ぬこ式 Threads 自動投稿 WebUI — Claude Code 用ガイド
 
 ## 🛑 最優先で読むこと（誤認禁止）
 
@@ -23,7 +23,7 @@ start.sh → このWebUIを起動するスクリプト
 - ✅ ユーザーが「自動投稿ツール」と言ったら → このプロジェクト
 - ✅ ユーザーが「WebUI / Webアプリ / アプリ」と言ったら → このプロジェクト
 - ✅ ユーザーが「立ち上げて / 起動して」と言ったら → `bash start.sh` で `http://localhost:3000` を起動
-- ✅ ユーザーが「セットアップして」と言ったら → `bash setup.sh` を実行
+- ✅ ユーザーが「セットアップして」と言ったら → まず旧フォルダ/旧 `prisma/dev.db` を探し、旧データがあれば `update.sh`、無ければ新規セットアップ
 
 このプロジェクトは Next.js + SQLite + Prisma + node-cron で構築された Threads自動投稿の**完全なWebアプリ本体**です。
 別ツールへの依存は無く、このフォルダだけで完結します（Claude Code CLI は AI 生成にのみ使用）。
@@ -104,11 +104,11 @@ find "$HOME/Desktop" "$HOME/Downloads" "$HOME/Documents" "$HOME" -maxdepth 4 -ty
   printf 'n\n' | bash update.sh "<見つかった旧フォルダの絶対パス>"   # 最後の「起動しますか」に n を送って対話回避
   ```
   → `update.sh` が旧 `prisma/dev.db`（アカウント・コンセプト・投稿・キュー・クラウドオフロード設定）を新フォルダに引き継ぎ＋依存更新＋migrate deploy する。終わったら `bash start.sh` をバックグラウンド起動 → 「アップデート完了。今までのアカウント・コンセプトがそのまま画面に出ているはずです。ブラウザで http://localhost:3000 を開いてください（自動で開かなければ）。**前のフォルダはすぐ消さず、ちゃんと動くのを確認してから消してください**」と plain に伝える。
-  - ⚠️ そのユーザーがクラウドオフロードを設定済み（旧 dev.db の `Account.cloudOffloadEnabled` が true、or `AppSetting` にGAS設定あり、or 旧フォルダに `gas-deploy/` がある）なら、続けて GASコードも更新する：「クラウドオフロードを設定済みなので、続けて Google 側のコードも最新にしますね」と言って原則②の `setup-cloud.sh` を実行 → 既設定検出で「① GASコードを最新に更新する」を選ぶ（スプシ・URL・トークンそのまま、URL不変）。設定してなければ不要。
+  - ⚠️ そのユーザーがクラウドオフロードを設定済み（旧 dev.db の `Account.cloudOffloadEnabled` が true、or `AppSetting` にGAS設定あり、or 旧フォルダに `gas-deploy/` がある）なら、続けて Google投稿も修復する：「クラウドオフロードを設定済みなので、続けて Google 側を修復しますね」と言って原則②の `setup-cloud.sh` を実行 → 既設定検出で「① Google投稿を修復する」を選ぶ。設定してなければ不要。
 - **前のインストールが複数見つかった** → plain な選択で聞く。各候補に「場所（例: デスクトップ）」と「中に何アカウント入っているか」を添える（`sqlite3 "<候補>/prisma/dev.db" "select count(*) from Account;"` で件数。sqlite3 が無ければ件数省略）。例：「前に使っていたフォルダの候補が2つあります。①デスクトップの『nuko-threads-webapp-v1』（アカウント2個）②書類フォルダの『nuko-threads-webapp-v1 (1)』（アカウント0個）— どっちで運用していましたか？（中身が入っている①が正解の可能性が高いです）」。選ばれた方で上の `update.sh` を実行。
 - **前のインストールが1つも見つからない**（＝初めての人）→ 引き継ぐデータなし。新規セットアップ（`setup.sh` には対話プロンプトがあるので中身を直接実行）：
   ```bash
-  npm install --no-audit --no-fund && npx prisma generate && npx prisma migrate deploy && npx tsx prisma/seed.ts && npx tsx prisma/seed-buzz-patterns.ts
+  npm install --no-audit --no-fund && npx prisma generate && npx prisma migrate deploy && npx tsx prisma/ensure-default-knowledge.ts
   ```
   → `bash start.sh` をバックグラウンド起動 → 「セットアップ完了。ブラウザで http://localhost:3000 を開いてください。最初に『設定 → アカウント追加』からアカウントを登録してください」と案内。
 - どのケースでも、`.command`/`.bat` のダブルクリックや「ターミナルで〜して」は**案内しない**（あなたが全部やったので）。`update.sh` がエラーを出したら（旧フォルダに dev.db が無い等）その内容に従って分岐（dev.db無し＝引き継ぐデータなし＝新規セットアップ扱い）。
@@ -136,10 +136,10 @@ find "$HOME/Desktop" "$HOME/Downloads" "$HOME/Documents" "$HOME" -maxdepth 4 -ty
 ### 補足：双方向クリックランチャー（フォルダの中の `.command` / `.bat`）
 
 このフォルダには、ダブルクリックするだけでターミナルが自動で開いて動く小さなファイルが入っている。ユーザーが「ターミナルって何？」となったら、これを使ってもらうのが一番ラク：
-- `初回セットアップ.command`（Mac）/ `初回セットアップ.bat`（Windows） … `setup.sh` を実行
-- `アプリ起動.command` / `アプリ起動.bat` … `start.sh` を実行（アプリを起動）
-- `アップデート.command` / `アップデート.bat` … `update.sh` を実行（新版へ更新）
-- `クラウドオフロード設定.command` / `クラウドオフロード設定.bat` … `setup-cloud.sh` を実行
+- `01_setup_mac.command`（Mac）/ `01_setup_windows.bat`（Windows） … `setup.sh` を実行
+- `02_start_mac.command` / `02_start_windows.bat` … `start.sh` を実行（アプリを起動）
+- `03_update_mac.command` / `03_update_windows.bat` … `update.sh` を実行（新版へ更新）
+- `04_cloud_setup_mac.command` / `04_cloud_setup_windows.bat` … `setup-cloud.sh` を実行
 
 ※ Mac で初めてダブルクリックすると「開発元を検証できないため開けません」と出ることがある → その `.command` ファイルを **右クリック →「開く」→「開く」** を1回押せばOK（2回目以降は普通にダブルクリックで動く）。あなた（Claude Code）が代わりに開く時は、先に `xattr -dr com.apple.quarantine . 2>/dev/null` を実行しておくとこの警告が出ない。
 
@@ -172,9 +172,11 @@ find "$HOME/Desktop" "$HOME/Downloads" "$HOME/Documents" "$HOME" -maxdepth 4 -ty
 
 ### 「セットアップして」「初期セットアップして」「インストールして」
 
+⛔ **最重要**：ユーザーが「セットアップして」と言っても、すでに前のバージョンを使っていた可能性がある。いきなり `setup.sh` / `npm install ... migrate ...` を実行しない。必ず先に旧フォルダと旧 `prisma/dev.db` を探す。旧データが見つかったら、それは新規セットアップではなくアップデートとして扱い、`update.sh "<旧フォルダ>"` で引き継ぐ。
+
 → 上の **「📦 セットアップ／アップデートの統一フロー」** に従う。**まず前のバージョンが他に無いか自分で探し**、あれば実は「アップデート」（旧 `prisma/dev.db` を引き継ぐ）として進める。無ければ新規セットアップ：
 ```bash
-npm install --no-audit --no-fund && npx prisma generate && npx prisma migrate deploy && npx tsx prisma/seed.ts && npx tsx prisma/seed-buzz-patterns.ts
+npm install --no-audit --no-fund && npx prisma generate && npx prisma migrate deploy && npx tsx prisma/ensure-default-knowledge.ts
 ```
 （依存インストール / Prismaクライアント生成 / DBマイグレーション / ナレッジ6本投入）→ **バックグラウンドで** `bash start.sh` 起動 → 「ブラウザで http://localhost:3000 を開いてください。最初に『設定 → アカウント追加』からアカウントを登録してください」。
 ※ ユーザーが「自分でターミナルでやりたい」と明言した場合だけ `bash setup.sh` か `初回セットアップ.command`（Mac）/ `.bat`（Windows）のダブルクリックを案内。それ以外は案内しない（あなたが代行する）。
@@ -206,7 +208,7 @@ curl --max-time 5 -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/ac
 
 ※ `setup-cloud.sh` は JSON 操作・組み立てを `node -e` で行う（以前は `python3` だったが、Windows 含めて Python 環境差でハマる人がいたため）。Node.js は `[1/8]` で必須チェック済みなので、追加で `python3` の存在チェックは不要。
 
-※ **既にそのアカウントでクラウドオフロード設定済みの場合**、`setup-cloud.sh` は「① GASコードを最新に更新する（スプシ・URL・トークンそのまま）／ ② 最初からやり直す」と聞いてくる。**アップデート後は ①** を選ばせる（コードだけ最新化、URLは変わらない、対話操作も不要 — 自動でPush＋デプロイ更新まで走る。失敗したら手動更新の案内が出る）。`②` は普段使わない（スプシを作り直したい特殊ケースのみ）。
+※ **既にそのアカウントでクラウドオフロード設定済みの場合**、`setup-cloud.sh` は「① Google投稿を修復する ／ ② 最初からやり直す」と聞いてくる。**アップデート後は ①** を選ばせる。アプリ側の修復APIが、コードPush、新しいWeb Appデプロイ、動作するURLの保存、自動実行・タイムゾーン・投稿用トークン・予約キューの確認まで行う。`②` は普段使わない（スプシを作り直したい特殊ケースのみ）。
 
 **前提（満たしていなければ先に案内）:**
 1. Webアプリが起動している（`setup-cloud.sh` 内で自動起動も対応）
@@ -296,15 +298,15 @@ https://gitmind.com/app/docs/m0456v7u
 2. **前のバージョンのフォルダを自分で探す**（`find "$HOME/Desktop" "$HOME/Downloads" "$HOME/Documents" "$HOME" -maxdepth 4 -type d \( -name 'nuko-threads-webapp*' -o -name 'threads-auto-webapp*' \) 2>/dev/null | sort -u` → `prisma/dev.db` がある & 今いる新フォルダ自身でない もの）。**ユーザーにパスを聞かない。** 複数あれば plain な選択肢で「どっちで運用してた？」と聞く（場所＋アカウント数を添える）。
 3. `printf 'n\n' | bash update.sh "<見つけた旧フォルダ>"` を実行 → 旧 `prisma/dev.db`（アカウント・コンセプト・投稿・キュー・クラウドオフロード設定）を新フォルダに引き継ぎ＋`npm install`＋`prisma generate`＋`prisma migrate deploy`（既定ナレッジの seed は再実行しない＝編集を上書きしないため）。
 4. `bash start.sh` をバックグラウンド起動 → 「アップデート完了。今までのアカウント・コンセプトがそのまま画面に出ているはずです。ブラウザで http://localhost:3000 を開いてください。**前のフォルダはすぐ消さず、ちゃんと動くのを確認してから消してください**」と plain に伝える。
-5. クラウドオフロード設定済みなら続けて `setup-cloud.sh` →「① GASコードを最新に更新する」（スプシ・URL・トークンそのまま、URL不変）。
-6. 前のバージョンが**見つからなかった**＝引き継ぐデータなし＝**新規セットアップ**（`npm install … && npx prisma generate && npx prisma migrate deploy && npx tsx prisma/seed.ts && npx tsx prisma/seed-buzz-patterns.ts` → `bash start.sh`）。
+5. クラウドオフロード設定済みなら続けて `setup-cloud.sh` →「① Google投稿を修復する」（コード・自動実行・動作するURL・予約キューまで確認）。
+6. 前のバージョンが**見つからなかった**＝引き継ぐデータなし＝**新規セットアップ**（`npm install … && npx prisma generate && npx prisma migrate deploy && npx tsx prisma/ensure-default-knowledge.ts` → `bash start.sh`）。
 
 ⚠️ やってはいけないこと:
 - ❌ 古いソースファイルだけを手で書き換える（差分パッチ運用）— **フォルダごと置き換える**のが安全
 - ❌ `prisma/dev.db` を削除する／別の dev.db で上書きする — ユーザーの全データが消える
 - ❌ ユーザーに「前のフォルダのパスを教えて／貼り付けて」と聞く — 自分で `find` して見つける
 - ❌ `.command`/`.bat` のダブルクリックや「ターミナルで〜して」を案内する — あなたが直接コマンドを実行して終わらせる（ユーザーが「自分でやりたい」と明言した時だけ案内）
-- ❌ アップデートのつもりで（旧データがあるのに）`bash setup.sh` 相当を実行する — 既定ナレッジの編集が初期化される。旧データがあれば必ず `update.sh`
+- ❌ アップデートのつもりで（旧データがあるのに）`bash setup.sh` 相当を実行する — アカウント、アクセストークン、下書き、予約投稿が新フォルダに引き継がれず、ユーザーには「消えた」ように見える。旧データがあれば必ず `update.sh`
 
 詳しい手順はフォルダ内の `UPDATE.md` 参照。
 
@@ -342,10 +344,10 @@ claude /login
 nuko-threads-webapp-v1/
 ├── README.md          ← ユーザー向け使い方
 ├── UPDATE.md          ← 旧版からのアップデート手順
-├── 初回セットアップ.command / .bat   ← ★ダブルクリックで初回セットアップ（ターミナルが自動で開く）
-├── アプリ起動.command / .bat         ← ★ダブルクリックでアプリ起動
-├── アップデート.command / .bat       ← ★ダブルクリックで新版へ更新
-├── クラウドオフロード設定.command / .bat ← ★ダブルクリックでクラウドオフロード設定
+├── 01_setup_mac.command / 01_setup_windows.bat         ← ★初回セットアップ
+├── 02_start_mac.command / 02_start_windows.bat         ← ★アプリ起動
+├── 03_update_mac.command / 03_update_windows.bat       ← ★新版へ更新
+├── 04_cloud_setup_mac.command / 04_cloud_setup_windows.bat ← ★クラウドオフロード設定
 ├── setup.sh           ← 初回セットアップ本体（npm install + DB初期化）
 ├── update.sh          ← 旧版から設定を引き継いで更新する本体（旧 prisma/dev.db をコピー）
 ├── start.sh           ← 起動本体（npx next dev）
@@ -356,23 +358,6 @@ nuko-threads-webapp-v1/
 └── tests/             ← 統合テスト（npm run test:cloud で実行可）
 ```
 （`.command` = Mac用ダブルクリック起動。`.bat` = Windows用。中身はそれぞれ対応する `.sh` を実行するだけ。）
-
----
-
-## 📝 ナレッジのAI編集
-
-`knowledge/` フォルダにアプリのナレッジがmdファイルとして保存されている。VSCodeからClaudeに直接編集してもらうためのフォルダ。
-
-- `knowledge/カスタム-raito_tenshoku/` — らいとアカウント専用ナレッジ（★主な編集対象）
-- `knowledge/カスタム-グローバル/` — 全アカウント共通のカスタムルール
-- `knowledge/デフォルト/` — 製品デフォルト（参考用）
-
-**ユーザーが「ナレッジを編集して」と言ったら**:
-1. 該当ファイルを `knowledge/` フォルダから読んで編集する
-2. 編集後「DBに同期する」と言われたら `node knowledge-sync.js --apply` を実行
-3. `node knowledge-sync.js`（`--apply` なし）はdry-runで差分確認のみ
-
-ナレッジ内容はファイルのフロントマター（`---`の後）を除いた本文部分のみ。`id:` フィールドは絶対に変えない。
 
 ---
 

@@ -36,9 +36,22 @@ export async function register() {
         .catch((e) => console.error("[startup] cloud-sync error:", e));
     }, 15_000);
 
+    // 毎朝4時: 全アカウントの直近投稿Insights更新（views/likes等）。
+    // 深夜帯でAPI負荷を分散。insights権限なし判定済みアカウントはスキップ。
+    cron.default.schedule(
+      "0 4 * * *",
+      () => {
+        import("@/lib/insights/fetch-runner")
+          .then(({ fetchAllAccountsInsights }) => fetchAllAccountsInsights())
+          .catch((e) => console.error("[cron] insights error:", e));
+      },
+      { timezone: "Asia/Tokyo" }
+    );
+
     console.log("[scheduler] Background jobs started:");
     console.log("  - Queue processor: every 1 min");
     console.log("  - Auto-generate: daily at 05:00");
     console.log("  - Cloud sync: every 5 min + delayed startup");
+    console.log("  - Insights refresh: daily at 04:00");
   }
 }

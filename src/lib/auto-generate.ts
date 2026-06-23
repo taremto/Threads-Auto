@@ -5,6 +5,7 @@
  */
 
 import { PrismaClient } from "@prisma/client";
+import { dailyPostCountFromPostingHours } from "./account-posting";
 
 const prisma = new PrismaClient();
 
@@ -38,7 +39,7 @@ export async function runAutoGenerate() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             accountId: account.id,
-            count: account.postsPerDay,
+            count: dailyPostCountFromPostingHours(account.postingHours),
           }),
         });
 

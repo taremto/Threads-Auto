@@ -9,8 +9,8 @@ type Account = {
   _count: { posts: number };
 };
 
-type Tab = "draft" | "queued" | "posted";
-type Page = "posts" | "overview" | "settings";
+type Tab = "draft" | "queued" | "posted" | "error";
+type Page = "posts" | "overview" | "analytics" | "competitor" | "settings";
 
 type SidebarProps = {
   activePage: Page;
@@ -49,16 +49,19 @@ export default function Sidebar({
     { key: "draft", label: "下書き" },
     { key: "queued", label: "キュー" },
     { key: "posted", label: "投稿済み" },
+    { key: "error", label: "エラー" },
   ];
 
   const menuItems: { key: Page; label: string }[] = [
     { key: "overview", label: "全体概要" },
+    { key: "analytics", label: "分析" },
+    { key: "competitor", label: "競合分析" },
     { key: "settings", label: "システム設定" },
   ];
 
   return (
     <aside
-      className="hidden md:flex flex-col w-56 h-screen min-h-screen shrink-0"
+      className="flex flex-col w-56 h-screen min-h-screen shrink-0"
       style={{ background: "var(--sidebar-bg)" }}
     >
       {/* Logo */}

@@ -1,14 +1,64 @@
 import { prisma } from "@/lib/prisma";
+import { validateObservedThreadsUserId } from "@/lib/account-identity";
+import type { Post } from "@prisma/client";
 import { NextResponse } from "next/server";
 import {
   cancelByPostId,
+  deleteMedia,
   endpointFromAccount,
+  gasVersionUpgradeMessage,
+  healthCheck,
+  isGasVersionSupported,
   pushQueue,
+  tokenFingerprintOf,
   toJstString,
   updateByPostId,
+  verifyQueueByPostIds,
   type PushPostInput,
 } from "@/lib/gas-bridge";
 import { hasPostIntervalConflict } from "@/lib/schedule";
+
+const MIN_RESERVATION_LEAD_MS = 60_000;
+
+function sortGroupPosts(a: Post, b: Post) {
+  if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+  return a.createdAt.getTime() - b.createdAt.getTime();
+}
+
+function mutableTargetsFor(selected: Post, groupPosts: Post[]) {
+  const sorted = [...groupPosts].sort(sortGroupPosts);
+  const hasPosted = sorted.some((p) => p.status === "posted");
+  if (!hasPosted) return sorted;
+
+  const selectedIndex = sorted.findIndex((p) => p.id === selected.id);
+  if (selectedIndex < 0 || selected.status === "posted") return [];
+
+  // ツリーの前半が投稿済みの場合は、投稿済み部分を絶対に触らない。
+  // 選択した失敗/未投稿コマ以降だけを再試行・下書き化・削除の対象にする。
+  return sorted.slice(selectedIndex).filter((p) => p.status !== "posted");
+}
+
+function ceilToNextMinute(date: Date) {
+  const next = new Date(date);
+  if (next.getSeconds() > 0 || next.getMilliseconds() > 0) {
+    next.setMinutes(next.getMinutes() + 1);
+  }
+  next.setSeconds(0, 0);
+  return next;
+}
+
+function nextSafeRetryAt(busyTimes: Date[]) {
+  let candidate = ceilToNextMinute(
+    new Date(Date.now() + Math.max(MIN_RESERVATION_LEAD_MS, 2 * 60_000))
+  );
+  for (let i = 0; i < 14 * 24 * 60; i++) {
+    if (!hasPostIntervalConflict(candidate, busyTimes)) return candidate;
+    candidate = new Date(candidate.getTime() + 60_000);
+  }
+  throw new Error(
+    "安全に再試行できる空き時間が見つかりませんでした。既存の予約を確認してから、手動で時刻を変更してください。"
+  );
+}
 
 /**
  * 同じグループの投稿をまとめてステータス変更 or 削除 or キュー追加 or 単一投稿の本文編集
@@ -16,6 +66,7 @@ import { hasPostIntervalConflict } from "@/lib/schedule";
  *   { postId, action: "status", status: string }
  *   { postId, action: "delete" }
  *   { postId, action: "queue", publishAt: string }  // ISO日時
+ *   { postId, action: "reschedule", publishAt: string }  // queued投稿の日時変更
  *   { postId, action: "edit", body: string }        // 単一投稿の本文のみ更新
  */
 export async function POST(request: Request) {
@@ -125,19 +176,59 @@ export async function POST(request: Request) {
 
     const groupPosts = await prisma.post.findMany({
       where: { accountId: post.accountId, groupNo: post.groupNo },
+      include: {
+        media: { where: { status: "ready" }, orderBy: { sortOrder: "asc" } },
+      },
     });
 
-    const ids = groupPosts.map((p) => p.id);
+    const sortedGroupPosts = [...groupPosts].sort(sortGroupPosts);
+    const mutableTargets = mutableTargetsFor(post, sortedGroupPosts);
+    const mutableIds = mutableTargets.map((p) => p.id);
+    // 添付画像（status="ready"のみ）を postId 単位で引けるようにする（GAS push時に使う）
+    const mediaByPostId = new Map<string, string[]>(
+      groupPosts.map((g) => [g.id, g.media.map((m) => m.publicUrl).filter(Boolean)])
+    );
+
+    if (
+      ["queue", "reschedule", "retryFailed", "failedToDraft", "delete"].includes(action) ||
+      (action === "status" && status === "draft")
+    ) {
+      if (mutableIds.length === 0) {
+        return NextResponse.json(
+          {
+            error:
+              "投稿済みの投稿は変更できません。ツリーの途中で失敗している場合は、赤いエラー行から操作してください。",
+          },
+          { status: 409 }
+        );
+      }
+    }
 
     // クラウドオフロード状態を判定
     const account = await prisma.account.findUnique({
       where: { id: post.accountId },
     });
-    const cloudEndpoint =
-      account?.cloudOffloadEnabled ? endpointFromAccount(account) : null;
+    if (!account) {
+      return NextResponse.json({ error: "account not found" }, { status: 404 });
+    }
+    const cloudEndpoint = account.cloudOffloadEnabled
+      ? endpointFromAccount(account)
+      : null;
 
-    // キューに追加（日時指定付き）
-    if (action === "queue" && publishAt) {
+    // キューに追加 / キュー済み投稿の日時変更（日時指定付き）
+    if ((action === "queue" || action === "reschedule") && publishAt) {
+      const migrationLock = await prisma.appSetting.findUnique({
+        where: { key: "migrationLock" },
+      });
+      if (migrationLock?.value === "true") {
+        return NextResponse.json(
+          {
+            error:
+              "Google投稿の修復中です。修復が終わってからもう一度キューに追加してください。",
+          },
+          { status: 409 }
+        );
+      }
       const publishAtDate = new Date(publishAt);
       if (!Number.isFinite(publishAtDate.getTime())) {
         return NextResponse.json(
@@ -145,11 +236,32 @@ export async function POST(request: Request) {
           { status: 400 }
         );
       }
+      if (publishAtDate.getTime() < Date.now() + MIN_RESERVATION_LEAD_MS) {
+        return NextResponse.json(
+          {
+            error:
+              "過去の時刻、または直前すぎる時刻には予約できません。今より1分以上あとの日時を選んでください。",
+          },
+          { status: 400 }
+        );
+      }
+      if (action === "reschedule") {
+        const notQueued = mutableTargets.filter((p) => p.status !== "queued");
+        if (notQueued.length > 0) {
+          return NextResponse.json(
+            {
+              error:
+                "予約中の投稿だけ時刻を変更できます。投稿済みや下書きは変更できません。",
+            },
+            { status: 409 }
+          );
+        }
+      }
 
       const busyPosts = await prisma.post.findMany({
         where: {
           accountId: post.accountId,
-          id: { notIn: ids },
+          id: { notIn: mutableIds },
           OR: [
             { status: "queued", publishAt: { not: null } },
             { status: "posted", postedAt: { not: null } },
@@ -171,14 +283,84 @@ export async function POST(request: Request) {
       }
 
       if (cloudEndpoint) {
-        const postsForGas: PushPostInput[] = groupPosts.map((p) => ({
-          webPostId: p.id,
-          groupNo: p.groupNo,
-          text: p.body,
-          postType: p.postType === "thread" ? "thread" : ("standalone" as const),
-          publishAtJst: toJstString(publishAtDate),
-          memo: p.memo || undefined,
-        }));
+        const gasHealth = await healthCheck(cloudEndpoint);
+        if (!gasHealth.ok || !gasHealth.data) {
+          return NextResponse.json(
+            {
+              error:
+                "Google側に接続できないため、予約をクラウドへ送れませんでした。ネット接続とクラウドオフロード設定を確認してください。",
+              detail: gasHealth.error,
+            },
+            { status: 502 }
+          );
+        }
+        if (!isGasVersionSupported(gasHealth.data.version)) {
+          return NextResponse.json(
+            { error: gasVersionUpgradeMessage(gasHealth.data.version) },
+            { status: 422 }
+          );
+        }
+        if (!gasHealth.data.configured) {
+          return NextResponse.json(
+            { error: "Google側の初期設定が未完了です。設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。" },
+            { status: 422 }
+          );
+        }
+        if (gasHealth.data.scriptTimeZone && gasHealth.data.scriptTimeZone !== "Asia/Tokyo") {
+          return NextResponse.json(
+            { error: "Google側のタイムゾーンが Asia/Tokyo ではありません。設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。" },
+            { status: 422 }
+          );
+        }
+        if (!gasHealth.data.hasTrigger) {
+          return NextResponse.json(
+            { error: "Google側の自動実行が見つかりません。設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。" },
+            { status: 422 }
+          );
+        }
+        const identityCheck = await validateObservedThreadsUserId(
+          {
+            accountId: account.id,
+            accountName: account.name,
+            currentThreadsUserId: account.threadsUserId,
+          },
+          gasHealth.data.userId
+        );
+        if (!identityCheck.ok) {
+          return NextResponse.json(
+            {
+              error: identityCheck.error,
+              expected: {
+                userId: identityCheck.expectedUserId,
+                tokenFingerprint: tokenFingerprintOf(account.accessToken),
+              },
+              observed: {
+                userId: identityCheck.observedUserId,
+                tokenFingerprint: gasHealth.data.tokenFingerprint || null,
+                version: gasHealth.data.version,
+              },
+            },
+            { status: 409 }
+          );
+        }
+        if (identityCheck.shouldBackfill) {
+          await prisma.account.update({
+            where: { id: account.id },
+            data: { threadsUserId: identityCheck.userId },
+          });
+        }
+        const postsForGas: PushPostInput[] = mutableTargets.map((p) => {
+          const imageUrls = mediaByPostId.get(p.id) ?? [];
+          return {
+            webPostId: p.id,
+            groupNo: p.groupNo,
+            text: p.body,
+            postType: p.postType === "thread" ? "thread" : ("standalone" as const),
+            publishAtJst: toJstString(publishAtDate),
+            memo: p.memo || undefined,
+            ...(imageUrls.length > 0 ? { imageUrls } : {}),
+          };
+        });
         const gasResult = await pushQueue(cloudEndpoint, postsForGas);
         if (!gasResult.ok) {
           return NextResponse.json(
@@ -186,16 +368,51 @@ export async function POST(request: Request) {
             { status: 502 }
           );
         }
+        const queueCheck = await verifyQueueByPostIds(
+          cloudEndpoint,
+          postsForGas.map((p) => p.webPostId)
+        );
+        if (!queueCheck.ok || !queueCheck.data) {
+          return NextResponse.json(
+            {
+              error:
+                "Google側に予約が入ったか確認できませんでした。Web画面では予約済みにしませんでした。もう一度お試しください。",
+              detail: queueCheck.error,
+            },
+            { status: 502 }
+          );
+        }
+        if (queueCheck.data.missing.length > 0) {
+          return NextResponse.json(
+            {
+              error:
+                "Google側に入っていない予約があります。Web画面では予約済みにしませんでした。もう一度お試しください。",
+              missing: queueCheck.data.missing.length,
+            },
+            { status: 502 }
+          );
+        }
+        const notWaiting = queueCheck.data.rows.filter((r) => r.status !== "待機中");
+        if (notWaiting.length > 0) {
+          return NextResponse.json(
+            {
+              error:
+                "Google側の予約状態が待機中ではありません。重複投稿を避けるため停止しました。今すぐ同期して状態を確認してください。",
+            },
+            { status: 409 }
+          );
+        }
         await prisma.post.updateMany({
-          where: { id: { in: ids } },
+          where: { id: { in: mutableIds } },
           data: {
             status: "queued",
             publishAt: publishAtDate,
             executor: "gas",
+            error: null,
           },
         });
         return NextResponse.json({
-          count: ids.length,
+          count: mutableIds.length,
           status: "queued",
           publishAt,
           executor: "gas",
@@ -203,27 +420,216 @@ export async function POST(request: Request) {
       }
 
       await prisma.post.updateMany({
-        where: { id: { in: ids } },
+        where: { id: { in: mutableIds } },
         data: {
           status: "queued",
           publishAt: publishAtDate,
           executor: "local",
+          error: null,
         },
       });
-      return NextResponse.json({ count: ids.length, status: "queued", publishAt });
+      return NextResponse.json({ count: mutableIds.length, status: "queued", publishAt });
+    }
+
+    // ツリー投稿の途中失敗を、投稿済みの親投稿を触らずに続きだけ再試行する。
+    if (action === "retryFailed") {
+      if (!mutableTargets.some((p) => p.status === "error")) {
+        return NextResponse.json(
+          { error: "再試行できるエラー投稿が見つかりませんでした。" },
+          { status: 409 }
+        );
+      }
+
+      const busyPosts = await prisma.post.findMany({
+        where: {
+          accountId: post.accountId,
+          id: { notIn: mutableIds },
+          OR: [
+            { status: "queued", publishAt: { not: null } },
+            { status: "posted", postedAt: { not: null } },
+          ],
+        },
+        select: { publishAt: true, postedAt: true },
+      });
+      const busyTimes = busyPosts
+        .map((p) => p.publishAt ?? p.postedAt)
+        .filter((d): d is Date => d instanceof Date);
+      const retryAt = nextSafeRetryAt(busyTimes);
+
+      if (cloudEndpoint) {
+        const gasHealth = await healthCheck(cloudEndpoint);
+        if (!gasHealth.ok || !gasHealth.data) {
+          return NextResponse.json(
+            {
+              error:
+                "Google側に接続できないため、失敗分の再試行を予約できませんでした。ネット接続とクラウドオフロード設定を確認してください。",
+              detail: gasHealth.error,
+            },
+            { status: 502 }
+          );
+        }
+        if (!isGasVersionSupported(gasHealth.data.version)) {
+          return NextResponse.json(
+            { error: gasVersionUpgradeMessage(gasHealth.data.version) },
+            { status: 422 }
+          );
+        }
+        if (!gasHealth.data.configured) {
+          return NextResponse.json(
+            { error: "Google側の初期設定が未完了です。設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。" },
+            { status: 422 }
+          );
+        }
+        if (gasHealth.data.scriptTimeZone && gasHealth.data.scriptTimeZone !== "Asia/Tokyo") {
+          return NextResponse.json(
+            { error: "Google側のタイムゾーンが Asia/Tokyo ではありません。設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。" },
+            { status: 422 }
+          );
+        }
+        if (!gasHealth.data.hasTrigger) {
+          return NextResponse.json(
+            { error: "Google側の自動実行が見つかりません。設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。" },
+            { status: 422 }
+          );
+        }
+        const identityCheck = await validateObservedThreadsUserId(
+          {
+            accountId: account.id,
+            accountName: account.name,
+            currentThreadsUserId: account.threadsUserId,
+          },
+          gasHealth.data.userId
+        );
+        if (!identityCheck.ok) {
+          return NextResponse.json(
+            {
+              error: identityCheck.error,
+              expected: {
+                userId: identityCheck.expectedUserId,
+                tokenFingerprint: tokenFingerprintOf(account.accessToken),
+              },
+              observed: {
+                userId: identityCheck.observedUserId,
+                tokenFingerprint: gasHealth.data.tokenFingerprint || null,
+                version: gasHealth.data.version,
+              },
+            },
+            { status: 409 }
+          );
+        }
+        if (identityCheck.shouldBackfill) {
+          await prisma.account.update({
+            where: { id: account.id },
+            data: { threadsUserId: identityCheck.userId },
+          });
+        }
+        const postsForGas: PushPostInput[] = mutableTargets.map((p) => {
+          const imageUrls = mediaByPostId.get(p.id) ?? [];
+          return {
+            webPostId: p.id,
+            groupNo: p.groupNo,
+            text: p.body,
+            postType: p.postType === "thread" ? "thread" : ("standalone" as const),
+            publishAtJst: toJstString(retryAt),
+            memo: p.memo || undefined,
+            ...(imageUrls.length > 0 ? { imageUrls } : {}),
+          };
+        });
+        const gasResult = await pushQueue(cloudEndpoint, postsForGas);
+        if (!gasResult.ok) {
+          return NextResponse.json(
+            { error: "GASへのPush失敗: " + (gasResult.error || "不明") },
+            { status: 502 }
+          );
+        }
+        const queueCheck = await verifyQueueByPostIds(
+          cloudEndpoint,
+          postsForGas.map((p) => p.webPostId)
+        );
+        if (!queueCheck.ok || !queueCheck.data) {
+          return NextResponse.json(
+            {
+              error:
+                "Google側に予約が入ったか確認できませんでした。Web画面では予約済みにしませんでした。もう一度お試しください。",
+              detail: queueCheck.error,
+            },
+            { status: 502 }
+          );
+        }
+        if (queueCheck.data.missing.length > 0) {
+          return NextResponse.json(
+            {
+              error:
+                "Google側に入っていない予約があります。Web画面では予約済みにしませんでした。もう一度お試しください。",
+              missing: queueCheck.data.missing.length,
+            },
+            { status: 502 }
+          );
+        }
+        const notWaiting = queueCheck.data.rows.filter((r) => r.status !== "待機中");
+        if (notWaiting.length > 0) {
+          return NextResponse.json(
+            {
+              error:
+                "Google側の予約状態が待機中ではありません。重複投稿を避けるため停止しました。今すぐ同期して状態を確認してください。",
+            },
+            { status: 409 }
+          );
+        }
+        await prisma.post.updateMany({
+          where: { id: { in: mutableIds } },
+          data: {
+            status: "queued",
+            publishAt: retryAt,
+            executor: "gas",
+            error: null,
+            retryCount: 0,
+          },
+        });
+        return NextResponse.json({
+          count: mutableIds.length,
+          status: "queued",
+          publishAt: retryAt.toISOString(),
+          executor: "gas",
+          partialRetry: true,
+        });
+      }
+
+      await prisma.post.updateMany({
+        where: { id: { in: mutableIds } },
+        data: {
+          status: "queued",
+          publishAt: retryAt,
+          executor: "local",
+          error: null,
+          retryCount: 0,
+        },
+      });
+      return NextResponse.json({
+        count: mutableIds.length,
+        status: "queued",
+        publishAt: retryAt.toISOString(),
+        executor: "local",
+        partialRetry: true,
+      });
     }
 
     // ステータス変更
-    if (action === "status" && status) {
-      const updateData: Record<string, unknown> = { status };
+    if ((action === "status" && status) || action === "failedToDraft") {
+      const nextStatus = action === "failedToDraft" ? "draft" : String(status);
+      const updateData: Record<string, unknown> = { status: nextStatus };
       // 下書きに戻す場合はpublishAtをクリア
-      if (status === "draft") {
+      if (nextStatus === "draft") {
         updateData.publishAt = null;
         updateData.executor = "local"; // executorも初期化
+        updateData.error = null;
+        updateData.threadsPostId = null;
+        updateData.postUrl = null;
+        updateData.postedAt = null;
 
         // GAS側にqueued中の行があればキャンセル（行は残してstatusを「下書き」へ）
         if (cloudEndpoint) {
-          const gasPosts = groupPosts.filter((p) => p.executor === "gas");
+          const gasPosts = mutableTargets.filter((p) => p.executor === "gas");
           for (const gp of gasPosts) {
             const cancelResult = await cancelByPostId(cloudEndpoint, gp.id);
             // 既に投稿済等の理由で失敗してもログ出して続行（DBはローカルへ戻す）
@@ -236,17 +642,25 @@ export async function POST(request: Request) {
         }
       }
       await prisma.post.updateMany({
-        where: { id: { in: ids } },
+        where: { id: { in: mutableIds } },
         data: updateData,
       });
-      return NextResponse.json({ count: ids.length, status });
+      return NextResponse.json({ count: mutableIds.length, status: nextStatus });
     }
 
     // 削除
     if (action === "delete") {
+      // 削除する投稿に紐づくDrive画像を、行を消す前に控えておく（あとでゴミ箱へ）
+      const mediaToTrash = cloudEndpoint
+        ? await prisma.postMedia.findMany({
+            where: { postId: { in: mutableIds }, driveFileId: { not: null } },
+            select: { driveFileId: true },
+          })
+        : [];
+
       // GAS側にqueued中の行があればキャンセル
       if (cloudEndpoint) {
-        const gasPosts = groupPosts.filter(
+        const gasPosts = mutableTargets.filter(
           (p) => p.executor === "gas" && p.status !== "posted"
         );
         for (const gp of gasPosts) {
@@ -259,9 +673,18 @@ export async function POST(request: Request) {
         }
       }
       await prisma.post.deleteMany({
-        where: { id: { in: ids } },
+        where: { id: { in: mutableIds } },
       });
-      return NextResponse.json({ count: ids.length, deleted: true });
+
+      // 投稿を消したら、その画像もDriveからゴミ箱へ（ベストエフォート・旧GAS/失敗は無視）
+      if (cloudEndpoint && mediaToTrash.length > 0) {
+        const ids = mediaToTrash
+          .map((m) => m.driveFileId)
+          .filter((x): x is string => !!x);
+        await deleteMedia(cloudEndpoint, ids).catch(() => {});
+      }
+
+      return NextResponse.json({ count: mutableIds.length, deleted: true });
     }
 
     return NextResponse.json({ error: "invalid action" }, { status: 400 });

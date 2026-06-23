@@ -75,6 +75,11 @@ export async function syncOneAccount(accountId: string): Promise<SyncAccountResu
     };
   }
 
+  // 保険: GAS から「エラー」通知が来ない（GAS側で status を切り替え忘れ、または通信断）ケースで
+  // queued/executor='gas' のまま publishAt から長時間経過した投稿を error 化する。
+  // pullResults 失敗時も走るよう、pullResults より前で実行する。
+  await escalateStaleQueuedGasPosts(accountId);
+
   const r = await pullResults(ep);
   if (!r.ok || !r.data) {
     return {
@@ -133,6 +138,46 @@ export async function syncOneAccount(accountId: string): Promise<SyncAccountResu
     tokenExpiresAt: r.data.tokenExpiresAt,
     recentErrorCount24h: r.data.recentErrorCount24h,
   };
+}
+
+/**
+ * GAS から正規の「エラー」通知が届かないまま、publishAt から長時間（既定60分）経過した
+ * queued/executor='gas' の投稿を error 化する保険。
+ *
+ * 背景: GAS の processScheduledPosts が「予約時刻を過ぎた」と判断したとき、過去には
+ * スプシのメモ列にだけ理由を書き、status を「待機中」のまま放置していた。pullResults は
+ * 「投稿済/エラー」しか返さないため、WebUI 側は永遠にその失敗を知らないままになっていた。
+ *
+ * GAS 側はその挙動を直したが、(1) ユーザーが GAS を未更新の状態、(2) GAS への通信断、
+ * (3) 想定外の状態保留、にも備えるため WebUI 側でも多重防御として error 化する。
+ */
+async function escalateStaleQueuedGasPosts(
+  accountId: string,
+  maxDelayMs: number = 60 * 60 * 1000
+): Promise<number> {
+  const cutoff = new Date(Date.now() - maxDelayMs);
+  const stale = await prisma.post.findMany({
+    where: {
+      accountId,
+      status: "queued",
+      executor: "gas",
+      publishAt: { lt: cutoff },
+    },
+    select: { id: true },
+  });
+  if (stale.length === 0) return 0;
+  await prisma.post.updateMany({
+    where: { id: { in: stale.map((p) => p.id) } },
+    data: {
+      status: "error",
+      error:
+        "予約時刻を1時間以上過ぎても投稿確認が取れませんでした。「失敗分だけ再試行」または「時刻変更」で復旧してください。",
+    },
+  });
+  console.warn(
+    `[gas-sync] escalateStaleQueuedGasPosts: accountId=${accountId} escalated=${stale.length}`
+  );
+  return stale.length;
 }
 
 async function applyOne(row: PullResultRow): Promise<boolean> {

@@ -3,17 +3,41 @@ import { NextResponse } from "next/server";
 import { parsePosts } from "@/lib/post-parser";
 import {
   describeClaudeCliError,
+  estimateClaudeGenerationTimeoutMs,
+  getClaudeUsageStatus,
+  recordClaudeUsageLimitError,
   runClaude,
   type ClaudeCliError,
 } from "@/lib/claude-cli";
+import {
+  buildRecommendedPostingPlan,
+} from "@/lib/recommended-times";
+import { computeAccountBestHours } from "@/lib/insights/best-hours";
+import {
+  dailyPostCountFromPostingHours,
+  MAX_GENERATE_POSTS,
+  normalizeAccountPostingHours,
+} from "@/lib/account-posting";
+import {
+  buildDiversityPlan,
+  buildDiversityPromptSection,
+  groupHistoricalPosts,
+  filterSimilarPosts,
+  type HistoricalPost,
+} from "@/lib/generation-diversity";
+
+// 類似回避のために参照する「直近の投稿」の最大件数
+const DIVERSITY_RECENT_LIMIT = 120;
 
 /**
  * AI投稿生成エンドポイント（Claude Code CLI版 — サブスク範囲内）
- * POST body: { accountId, count: number, extraInstructions?: string }
+ * POST body: { accountId, count: number }
  */
 export async function POST(request: Request) {
   try {
-    const { accountId, count = 4, extraInstructions } = await request.json();
+    const { accountId, count, extraInstructions } = await request.json();
+    const extra =
+      typeof extraInstructions === "string" ? extraInstructions.trim() : "";
 
     if (!accountId) {
       return NextResponse.json(
@@ -44,8 +68,10 @@ export async function POST(request: Request) {
     // ナレッジ取得（アカウント固有 + 共通、enabled=true のみ）
     const knowledges = await prisma.knowledge.findMany({
       where: {
-        OR: [{ accountId }, { accountId: null }],
-        enabled: true,
+        AND: [
+          { OR: [{ accountId }, { accountId: null }] },
+          { enabled: true },
+        ],
       },
       orderBy: [{ type: "asc" }, { sortOrder: "asc" }],
     });
@@ -54,15 +80,59 @@ export async function POST(request: Request) {
     const structuresKnowledge = knowledges.find((k) => k.type === "structures");
     const customKnowledges = knowledges.filter((k) => k.type === "custom");
 
-    // 投稿時間帯
-    let postingHours: number[];
-    try {
-      postingHours = JSON.parse(account.postingHours);
-    } catch {
-      postingHours = [6, 12, 18, 21];
+    // 投稿時間帯。1日分の生成本数は、この時間帯の数を正とする。
+    const postingHours = normalizeAccountPostingHours(account.postingHours);
+
+    const defaultCount = dailyPostCountFromPostingHours(account.postingHours);
+    const wantCount = Math.max(
+      1,
+      Math.min(MAX_GENERATE_POSTS, Number(count) || defaultCount)
+    );
+
+    const usage = getClaudeUsageStatus();
+    if (usage.maxRecommendedPosts === 0) {
+      return NextResponse.json(
+        {
+          error:
+            `${usage.title}\n${usage.message}\n${usage.nextAction}`,
+          usage,
+        },
+        { status: 429 }
+      );
+    }
+    if (
+      typeof usage.maxRecommendedPosts === "number" &&
+      wantCount > usage.maxRecommendedPosts
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            `${usage.title}\n${usage.message}\n${usage.nextAction}\n\n今回は${usage.maxRecommendedPosts}投稿以下に減らしてください。`,
+          usage,
+        },
+        { status: 429 }
+      );
     }
 
-    const wantCount = Math.max(1, Math.min(40, Number(count) || 4));
+    // 類似回避・投稿タイプローテーション用に、直近の投稿を取得してグルーピング
+    const recentRaw = await prisma.post.findMany({
+      where: { accountId },
+      select: { groupNo: true, body: true, createdAt: true },
+      orderBy: { createdAt: "desc" },
+      take: DIVERSITY_RECENT_LIMIT,
+    });
+    const historicalPosts: HistoricalPost[] = groupHistoricalPosts(
+      recentRaw.map((p) => ({
+        groupNo: p.groupNo ?? 0,
+        body: p.body,
+        createdAt: p.createdAt,
+      }))
+    );
+    const diversityPlan = buildDiversityPlan(wantCount, historicalPosts.length);
+    const diversitySection = buildDiversityPromptSection(
+      diversityPlan,
+      historicalPosts
+    );
 
     // プロンプト構築
     const prompt = buildPrompt(
@@ -72,16 +142,22 @@ export async function POST(request: Request) {
       customKnowledges.map((k) => k.content),
       postingHours,
       wantCount,
-      typeof extraInstructions === "string" ? extraInstructions.trim() : ""
+      extra,
+      diversitySection
     );
+    const timeoutMs = estimateClaudeGenerationTimeoutMs({
+      promptChars: prompt.length,
+      count: wantCount,
+    });
 
     // Claude CLI 実行（サブスク範囲内 / プロンプトは stdin 経由で渡す）
     let generatedText: string;
     try {
-      generatedText = await runClaude(prompt);
+      generatedText = await runClaude(prompt, { timeoutMs });
     } catch (e: unknown) {
       const err = e as ClaudeCliError;
       const rawDetail = `${err.stderr || ""}\n${err.stdout || ""}\n${err.message || ""}`.trim();
+      recordClaudeUsageLimitError(rawDetail);
       console.error("Claude CLI error:", rawDetail);
       return NextResponse.json(
         {
@@ -115,6 +191,24 @@ export async function POST(request: Request) {
       );
     }
 
+    // 類似チェック：過去投稿・同一バッチ内で似すぎた投稿は保存しない
+    const { kept, skipped } = filterSimilarPosts(
+      posts,
+      diversityPlan,
+      historicalPosts
+    );
+    const finalPosts = kept.map((k) => k.post);
+    const skippedSimilar = skipped.length;
+    if (finalPosts.length === 0) {
+      return NextResponse.json(
+        {
+          error:
+            "生成した投稿がすべて過去の投稿と似すぎていたため、保存をスキップしました。もう一度生成するか、「追加指示」で別の場面・悩み・結論を指定してください。",
+        },
+        { status: 422 }
+      );
+    }
+
     // 最大groupNoとsortOrderを取得
     const [maxGroup, maxSort] = await Promise.all([
       prisma.post.aggregate({
@@ -130,8 +224,28 @@ export async function POST(request: Request) {
     let groupNo = (maxGroup._max.groupNo ?? 0) + 1;
     let sortOrder = (maxSort._max.sortOrder ?? 0) + 1;
 
+    // 実データ（時間別パフォーマンス）から推奨枠を割り出す。失敗時はnull→従来ルールにフォールバック。
+    const preferred = await computeAccountBestHours(accountId, postingHours).catch(
+      () => null
+    );
+
+    const recommendations = buildRecommendedPostingPlan(
+      account.conceptSheet,
+      postingHours,
+      finalPosts.length,
+      { postTexts: finalPosts.map((post) => post.items.join("\n\n")), preferred }
+    );
+
     const dbData = [];
-    for (const post of posts) {
+    for (const [index, post] of finalPosts.entries()) {
+      const recommendation = recommendations[index];
+      const recommendationData = recommendation
+        ? {
+            recommendedHour: recommendation.hour,
+            recommendedLabel: recommendation.label,
+            recommendedReason: recommendation.reason,
+          }
+        : {};
       if (post.thread && post.items.length > 1) {
         for (const item of post.items) {
           dbData.push({
@@ -143,6 +257,7 @@ export async function POST(request: Request) {
             status: "draft",
             batchFile: "ai-generate",
             sortOrder: sortOrder++,
+            ...recommendationData,
           });
         }
       } else {
@@ -156,6 +271,7 @@ export async function POST(request: Request) {
           status: "draft",
           batchFile: "ai-generate",
           sortOrder: sortOrder++,
+          ...recommendationData,
         });
       }
       groupNo++;
@@ -164,7 +280,12 @@ export async function POST(request: Request) {
     const result = await prisma.post.createMany({ data: dbData });
 
     return NextResponse.json(
-      { count: result.count, posts: posts.length },
+      {
+        count: result.count,
+        posts: finalPosts.length,
+        skippedSimilar,
+        recommendations,
+      },
       { status: 201 }
     );
   } catch (e) {
@@ -183,7 +304,8 @@ function buildPrompt(
   customKnowledges: string[],
   postingHours: number[],
   count: number,
-  extraInstructions: string = ""
+  extraInstructions: string = "",
+  diversitySection: string = ""
 ): string {
   const parts = [
     "あなたはSNSコンテンツの専門家です。以下のコンセプト定義・ルール・構成パターンに基づき、そのまま投稿できる品質のThreads投稿を生成してください。",
@@ -192,6 +314,10 @@ function buildPrompt(
     conceptSheet,
     "",
   ];
+
+  if (diversitySection) {
+    parts.push(diversitySection, "");
+  }
 
   if (extraInstructions) {
     parts.push(
@@ -239,7 +365,8 @@ function buildPrompt(
     "",
     "## 生成指示",
     `- ${count}本のスレッド投稿（ツリー投稿）を生成する。**全件スレッド型で出力すること。単体投稿は1本も含めない。**`,
-    `- 投稿時間帯: ${postingHours.map((h) => `${h}時`).join("、")}`,
+    `- 投稿時間帯の候補: ${postingHours.map((h) => `${h}時`).join("、")}`,
+    "- 投稿時間帯のおすすめ表示はアプリ側で自動計算するため、本文中には時刻や予約案内を書かない",
     "- 各スレッドは **2投稿（基本）または3投稿（深い話・ステップ系のみ）** で構成する。**4投稿以上は厳禁**（読者離脱率が急増し、API側のリプライ伝播ラグで投稿失敗率も上がるため）",
     "- 2投稿型: ■1 フック＋橋渡し / ■2 本編＋締め（CTAあれば最後に自然に溶け込ませる）",
     "- 3投稿型: ■1 フック / ■2 本編 / ■3 締め＋CTA",

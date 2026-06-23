@@ -1,8 +1,11 @@
 "use client";
 
+type PostMediaLite = { id: string; publicUrl: string; status: string };
+
 type Post = {
   id: string;
   groupNo: number;
+  sortOrder: number;
   body: string;
   postType: string;
   charCount: number;
@@ -11,12 +14,26 @@ type Post = {
   scheduledMin: number | null;
   publishAt: string | null;
   status: string;
+  media?: PostMediaLite[];
 };
 
 type Props = {
   posts: Post[];
   onClose: () => void;
 };
+
+function MediaStrip({ media }: { media?: PostMediaLite[] }) {
+  const imgs = (media ?? []).filter((m) => m.publicUrl);
+  if (imgs.length === 0) return null;
+  return (
+    <div className="tp-media">
+      {imgs.map((m) => (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img key={m.id} src={m.publicUrl} alt="" className="tp-img" />
+      ))}
+    </div>
+  );
+}
 
 function statusBadge(status: string) {
   switch (status) {
@@ -50,8 +67,49 @@ function dateLabel(p: Post) {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
+// Threadsアプリと同じ4アクションのアウトラインアイコン（いいね/返信/リポスト/シェア）
+function MetaIcons() {
+  const common = {
+    width: 19,
+    height: 19,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.7,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+  };
+  return (
+    <div className="tp-meta">
+      {/* いいね */}
+      <svg {...common} aria-label="いいね">
+        <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z" />
+      </svg>
+      {/* 返信 */}
+      <svg {...common} aria-label="返信">
+        <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />
+      </svg>
+      {/* リポスト */}
+      <svg {...common} aria-label="リポスト">
+        <path d="m17 2 4 4-4 4" />
+        <path d="M3 11v-1a4 4 0 0 1 4-4h14" />
+        <path d="m7 22-4-4 4-4" />
+        <path d="M21 13v1a4 4 0 0 1-4 4H3" />
+      </svg>
+      {/* シェア */}
+      <svg {...common} aria-label="シェア">
+        <path d="M22 2 11 13" />
+        <path d="M22 2 15 22 11 13 2 9 22 2Z" />
+      </svg>
+    </div>
+  );
+}
+
 export default function PostPreviewModal({ posts, onClose }: Props) {
-  const sorted = [...posts].sort((a, b) => a.groupNo - b.groupNo);
+  const sorted = [...posts].sort((a, b) => {
+    if (a.groupNo !== b.groupNo) return a.groupNo - b.groupNo;
+    return a.sortOrder - b.sortOrder;
+  });
   const isThread = sorted.length > 1 || sorted[0]?.postType === "thread";
   const head = sorted[0];
   const badge = head ? statusBadge(head.status) : null;
@@ -82,7 +140,7 @@ export default function PostPreviewModal({ posts, onClose }: Props) {
           .tp-name{color:#fff;font-size:14px;font-weight:700}
           .tp-time{color:#666;font-size:14px}
           .tp-text{color:#f5f5f5;font-size:14px;line-height:1.5;word-break:break-word;overflow-wrap:break-word;white-space:pre-wrap;padding-left:48px}
-          .tp-meta{display:flex;gap:14px;margin-top:10px;color:#555;font-size:11px;padding-left:48px}
+          .tp-meta{display:flex;align-items:center;gap:16px;margin-top:10px;color:#8a8a8a;font-size:11px;padding-left:48px}
           .tp-thread-line{margin-left:34px}
           .tp-thread-line .bar{width:2px;height:18px;background:#333}
           .tp-badge{display:inline-block;padding:2px 7px;border-radius:8px;font-size:9px;font-weight:700;margin-left:6px}
@@ -92,6 +150,8 @@ export default function PostPreviewModal({ posts, onClose }: Props) {
           .b-err{background:#2a0f0f;color:#f87171}
           .tp-cc{color:#555;font-size:10px;margin-top:4px;padding-left:48px}
           .tp-cc-over{color:#f87171}
+          .tp-media{display:flex;gap:6px;overflow-x:auto;padding:8px 0 0 48px}
+          .tp-img{width:160px;height:160px;object-fit:cover;border-radius:12px;border:1px solid #222;flex-shrink:0}
           .tp-empty{padding:40px 14px;text-align:center;color:#555;font-size:13px;line-height:1.6}
         `}</style>
 
@@ -126,15 +186,11 @@ export default function PostPreviewModal({ posts, onClose }: Props) {
                         </span>
                       </div>
                       <div className="tp-text">{p.body}</div>
+                      <MediaStrip media={p.media} />
                       <div className={`tp-cc${cc > 500 ? " tp-cc-over" : ""}`}>
                         {cc}文字
                       </div>
-                      <div className="tp-meta">
-                        <span>♡</span>
-                        <span>💬</span>
-                        <span>🔄</span>
-                        <span>📤</span>
-                      </div>
+                      <MetaIcons />
                     </div>
                   );
                 })}
@@ -157,17 +213,13 @@ export default function PostPreviewModal({ posts, onClose }: Props) {
                           </span>
                         </div>
                         <div className="tp-text">{p.body}</div>
+                        <MediaStrip media={p.media} />
                         <div
                           className={`tp-cc${cc > 500 ? " tp-cc-over" : ""}`}
                         >
                           ■{idx + 1} {cc}文字
                         </div>
-                        <div className="tp-meta">
-                          <span>♡</span>
-                          <span>💬</span>
-                          <span>🔄</span>
-                          <span>📤</span>
-                        </div>
+                        <MetaIcons />
                       </div>
                       {idx < sorted.length - 1 && (
                         <div className="tp-thread-line">

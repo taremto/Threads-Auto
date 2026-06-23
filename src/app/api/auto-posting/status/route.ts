@@ -1,8 +1,23 @@
 import { prisma } from "@/lib/prisma";
-import { endpointFromAccount, healthCheck } from "@/lib/gas-bridge";
+import {
+  endpointFromAccount,
+  gasVersionUpgradeMessage,
+  healthCheck,
+  isGasVersionSupported,
+} from "@/lib/gas-bridge";
 import { NextResponse } from "next/server";
 
 type Level = "ok" | "warning" | "error" | "off";
+
+type RecentErrorPost = {
+  id: string;
+  groupNo: number;
+  bodyPreview: string;
+  error: string | null;
+  executor: string;
+  publishAt: string | null;
+  updatedAt: string;
+};
 
 type AccountStatus = {
   accountId: string;
@@ -20,8 +35,11 @@ type AccountStatus = {
   queuedGas: number;
   overdueQueued: number;
   error24h: number;
+  lastPostedAt: string | null;
+  safetyHoldUntil: string | null;
   lastSyncedAt: string | null;
   tokenExpiresAt: string | null;
+  recentErrors: RecentErrorPost[];
   gas: {
     ok: boolean;
     configured: boolean | null;
@@ -33,6 +51,13 @@ type AccountStatus = {
     scriptTimeZone: string | null;
     spreadsheetTimeZone: string | null;
     version: string | null;
+    triggerResetAt: string | null;
+    lastProcessAttemptAt: string | null;
+    lastProcessFinishAt: string | null;
+    lastProcessSkippedAt: string | null;
+    lastProcessSummary: string | null;
+    lastProcessErrorAt: string | null;
+    lastProcessError: string | null;
     error: string | null;
   };
   support: {
@@ -42,6 +67,12 @@ type AccountStatus = {
     tokenFingerprint: string | null;
   };
 };
+
+function bodyPreview(body: string): string {
+  const compact = body.replace(/\s+/g, " ").trim();
+  if (compact.length <= 80) return compact;
+  return `${compact.slice(0, 80)}...`;
+}
 
 function daysUntil(iso: string | null): number | null {
   if (!iso) return null;
@@ -70,8 +101,11 @@ function summarize(account: {
   queuedGas: number;
   overdueQueued: number;
   error24h: number;
+  lastPostedAt?: string | null;
   nextPostAt?: string | null;
-}, gas: AccountStatus["gas"]): Pick<AccountStatus, "level" | "title" | "message" | "nextAction"> {
+}, gas: AccountStatus["gas"], opts: {
+  duplicateGasUrl: boolean;
+}): Pick<AccountStatus, "level" | "title" | "message" | "nextAction"> {
   if (!account.accessToken) {
     return {
       level: "error",
@@ -86,7 +120,16 @@ function summarize(account: {
       level: "error",
       title: "直近24時間に投稿エラーがあります",
       message: "一部の予約投稿が失敗しています。エラー内容を確認してください。",
-      nextAction: "投稿一覧のエラー表示を確認し、必要ならアクセストークンを更新してください。",
+      nextAction: "左メニューの「エラー」を開いて内容を確認し、必要ならアクセストークンを更新してください。",
+    };
+  }
+
+  if (opts.duplicateGasUrl) {
+    return {
+      level: "error",
+      title: "クラウド投稿の設定が他アカウントと重複しています",
+      message: "同じGoogle連携を複数アカウントで使うと、別アカウントのトークンで投稿されるおそれがあります。",
+      nextAction: "誤投稿を防ぐため、このアカウントで「Google投稿を修復する」を押してください。アプリが別のGoogle連携を保存し直します。",
     };
   }
 
@@ -109,15 +152,6 @@ function summarize(account: {
     };
   }
 
-  if (counts.overdueQueued > 0) {
-    return {
-      level: "warning",
-      title: "予定時刻を過ぎた投稿があります",
-      message: "投稿処理が止まっている、または結果同期が遅れている可能性があります。",
-      nextAction: "自動投稿チェックを再実行し、改善しなければサポート用レポートを送ってください。",
-    };
-  }
-
   const hasEndpoint = !!account.gasWebAppUrl && !!account.gasWebAppKey;
   if (account.cloudOffloadEnabled) {
     if (!hasEndpoint) {
@@ -125,7 +159,7 @@ function summarize(account: {
         level: "error",
         title: "クラウド投稿の設定が壊れています",
         message: "クラウド投稿はONですが、Google側の接続情報が見つかりません。",
-        nextAction: "クラウドオフロードを再設定してください。",
+        nextAction: "設定のクラウドオフロード欄で「Google投稿を修復する」を押してください。",
       };
     }
     if (!gas.ok) {
@@ -133,7 +167,15 @@ function summarize(account: {
         level: "error",
         title: "Google側に接続できません",
         message: "PCを閉じても投稿するためのGoogle連携に接続できませんでした。",
-        nextAction: "ネット接続とGAS URLを確認し、サポート用レポートを送ってください。",
+        nextAction: "設定のクラウドオフロード欄、またはこの画面の「Google投稿を修復する」を押してください。直らなければサポート用レポートを送ってください。",
+      };
+    }
+    if (!isGasVersionSupported(gas.version)) {
+      return {
+        level: "error",
+        title: "Google側のコードが古いです",
+        message: "アプリ本体とは別に、Google側の投稿コードも更新する必要があります。",
+        nextAction: gasVersionUpgradeMessage(gas.version),
       };
     }
     if (!gas.configured) {
@@ -141,7 +183,7 @@ function summarize(account: {
         level: "error",
         title: "Google側の初期設定が未完了です",
         message: "Google側に投稿用トークンが入っていません。",
-        nextAction: "クラウドオフロードを再設定してください。",
+        nextAction: "設定のクラウドオフロード欄、またはこの画面の「Google投稿を修復する」を押してください。",
       };
     }
     if (gas.tokenStatus === "failed" || gas.tokenLastError) {
@@ -149,7 +191,7 @@ function summarize(account: {
         level: "error",
         title: "アクセストークンの自動更新に失敗しています",
         message: "Google側で投稿に使う許可情報を更新できませんでした。",
-        nextAction: "アクセストークンを取り直して、クラウドオフロードを再設定してください。",
+        nextAction: "アクセストークンを取り直して保存し、その後「Google投稿を修復する」を押してください。",
       };
     }
     if (gas.scriptTimeZone && gas.scriptTimeZone !== "Asia/Tokyo") {
@@ -157,7 +199,7 @@ function summarize(account: {
         level: "error",
         title: "Google側のタイムゾーンが違います",
         message: "予約時刻と実際の投稿時刻がずれる可能性があります。",
-        nextAction: "GASプロジェクトのタイムゾーンをAsia/Tokyoに直して再設定してください。",
+        nextAction: "「Google投稿を修復する」を押してください。アプリがGoogle側のタイムゾーンを確認します。",
       };
     }
     if (!gas.hasTrigger) {
@@ -165,15 +207,61 @@ function summarize(account: {
         level: "error",
         title: "Google側の自動実行が止まっています",
         message: "予約時刻になっても投稿されない可能性があります。",
-        nextAction: "クラウドオフロードを再設定してください。",
+        nextAction: "「Google投稿を修復する」を押してください。アプリが自動実行を作り直します。",
+      };
+    }
+    if (gas.lastProcessError) {
+      return {
+        level: "error",
+        title: "Google側の自動実行でエラーが出ています",
+        message: gas.lastProcessError,
+        nextAction: "「Google投稿を修復する」を押してください。直らなければサポート用レポートを送ってください。",
+      };
+    }
+    if (counts.queuedGas > 0 && counts.nextPostAt) {
+      const nextMs = new Date(counts.nextPostAt).getTime();
+      const attemptMs = gas.lastProcessAttemptAt
+        ? new Date(gas.lastProcessAttemptAt).getTime()
+        : NaN;
+      if (
+        Number.isFinite(nextMs) &&
+        Date.now() - nextMs > 3 * 60 * 1000 &&
+        (!Number.isFinite(attemptMs) || attemptMs < nextMs)
+      ) {
+        return {
+          level: "error",
+          title: "Google側の自動実行が動いていません",
+          message: "予約時刻を過ぎていますが、Google側の投稿処理が起動した記録がありません。",
+          nextAction: "「Google投稿を修復する」を押してください。アプリが自動実行を作り直します。",
+        };
+      }
+    }
+    if (counts.overdueQueued > 0) {
+      const lastPostedMs = counts.lastPostedAt ? new Date(counts.lastPostedAt).getTime() : NaN;
+      const safetyHoldMs = Number.isFinite(lastPostedMs)
+        ? lastPostedMs + 60 * 60 * 1000
+        : NaN;
+      if (Number.isFinite(safetyHoldMs) && Date.now() < safetyHoldMs) {
+        return {
+          level: "ok",
+          title: "安全間隔のため待機中です",
+          message: "直近投稿から1時間以上空けるため、予定時刻を過ぎた投稿をGoogle側で待機させています。",
+          nextAction: "1時間の安全間隔を過ぎると、Google側が1予約ずつ自動で投稿します。",
+        };
+      }
+      return {
+        level: "warning",
+        title: "予定時刻を過ぎた投稿があります",
+        message: "Google側の投稿処理またはWeb画面への結果反映が遅れている可能性があります。",
+        nextAction: "設定画面の「今すぐ同期」を押してください。改善しなければサポート用レポートを送ってください。",
       };
     }
     if (!gas.hasTokenRefreshTrigger) {
       return {
         level: "warning",
-        title: "トークン自動更新の予約が見つかりません",
-        message: "今すぐ投稿はできても、長期間放置すると投稿許可の期限が切れる可能性があります。",
-        nextAction: "クラウドオフロードを再設定してください。",
+      title: "トークン自動更新の予約が見つかりません",
+      message: "今すぐ投稿はできても、長期間放置すると投稿許可の期限が切れる可能性があります。",
+      nextAction: "「Google投稿を修復する」を押してください。アプリが自動更新の予約を作り直します。",
       };
     }
     if (counts.queuedGas > 0 && !recentEnough(account.lastSyncedAt?.toISOString() ?? null)) {
@@ -238,6 +326,14 @@ export async function GET() {
     const accounts = await prisma.account.findMany({
       orderBy: { createdAt: "asc" },
     });
+    const gasUrlCounts = new Map<string, number>();
+    for (const account of accounts) {
+      if (!account.gasWebAppUrl) continue;
+      gasUrlCounts.set(
+        account.gasWebAppUrl,
+        (gasUrlCounts.get(account.gasWebAppUrl) ?? 0) + 1
+      );
+    }
     const now = new Date();
     const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
     const overdueBefore = new Date(now.getTime() - 5 * 60 * 1000);
@@ -250,7 +346,9 @@ export async function GET() {
           queuedGas,
           overdueQueued,
           error24h,
+          recentErrors,
           nextQueued,
+          lastPosted,
         ] = await Promise.all([
           prisma.post.count({ where: { accountId: account.id, status: "queued" } }),
           prisma.post.count({ where: { accountId: account.id, status: "queued", executor: "local" } }),
@@ -269,6 +367,24 @@ export async function GET() {
               updatedAt: { gte: oneDayAgo },
             },
           }),
+          prisma.post.findMany({
+            where: {
+              accountId: account.id,
+              status: "error",
+              updatedAt: { gte: oneDayAgo },
+            },
+            orderBy: { updatedAt: "desc" },
+            take: 3,
+            select: {
+              id: true,
+              groupNo: true,
+              body: true,
+              error: true,
+              executor: true,
+              publishAt: true,
+              updatedAt: true,
+            },
+          }),
           prisma.post.findFirst({
             where: {
               accountId: account.id,
@@ -277,6 +393,15 @@ export async function GET() {
             },
             orderBy: { publishAt: "asc" },
             select: { publishAt: true },
+          }),
+          prisma.post.findFirst({
+            where: {
+              accountId: account.id,
+              status: "posted",
+              postedAt: { not: null },
+            },
+            orderBy: { postedAt: "desc" },
+            select: { postedAt: true },
           }),
         ]);
 
@@ -291,6 +416,13 @@ export async function GET() {
           scriptTimeZone: null,
           spreadsheetTimeZone: null,
           version: null,
+          triggerResetAt: null,
+          lastProcessAttemptAt: null,
+          lastProcessFinishAt: null,
+          lastProcessSkippedAt: null,
+          lastProcessSummary: null,
+          lastProcessErrorAt: null,
+          lastProcessError: null,
           error: null,
         };
         const endpoint = endpointFromAccount(account);
@@ -308,6 +440,13 @@ export async function GET() {
               scriptTimeZone: health.data.scriptTimeZone ?? null,
               spreadsheetTimeZone: health.data.spreadsheetTimeZone ?? null,
               version: health.data.version ?? null,
+              triggerResetAt: health.data.triggerResetAt ?? null,
+              lastProcessAttemptAt: health.data.lastProcessAttemptAt ?? null,
+              lastProcessFinishAt: health.data.lastProcessFinishAt ?? null,
+              lastProcessSkippedAt: health.data.lastProcessSkippedAt ?? null,
+              lastProcessSummary: health.data.lastProcessSummary ?? null,
+              lastProcessErrorAt: health.data.lastProcessErrorAt ?? null,
+              lastProcessError: health.data.lastProcessError ?? null,
               error: null,
             };
           } else {
@@ -324,9 +463,23 @@ export async function GET() {
           queuedGas,
           overdueQueued,
           error24h,
+          lastPostedAt: lastPosted?.postedAt?.toISOString() ?? null,
           nextPostAt: nextQueued?.publishAt?.toISOString() ?? null,
         };
-        const summary = summarize(account, counts, gas);
+        const lastPostedMs = counts.lastPostedAt
+          ? new Date(counts.lastPostedAt).getTime()
+          : NaN;
+        const safetyHoldUntil =
+          Number.isFinite(lastPostedMs) &&
+          counts.overdueQueued > 0 &&
+          counts.queuedGas > 0
+            ? new Date(lastPostedMs + 60 * 60 * 1000).toISOString()
+            : null;
+        const summary = summarize(account, counts, gas, {
+          duplicateGasUrl:
+            !!account.gasWebAppUrl &&
+            (gasUrlCounts.get(account.gasWebAppUrl) ?? 0) > 1,
+        });
 
         return {
           accountId: account.id,
@@ -341,8 +494,19 @@ export async function GET() {
           queuedGas,
           overdueQueued,
           error24h,
+          lastPostedAt: counts.lastPostedAt,
+          safetyHoldUntil,
           lastSyncedAt: account.lastSyncedAt?.toISOString() ?? null,
           tokenExpiresAt: gas.tokenExpiresAt ?? account.tokenExpiresAt?.toISOString() ?? null,
+          recentErrors: recentErrors.map((post) => ({
+            id: post.id,
+            groupNo: post.groupNo,
+            bodyPreview: bodyPreview(post.body),
+            error: post.error || null,
+            executor: post.executor,
+            publishAt: post.publishAt?.toISOString() ?? null,
+            updatedAt: post.updatedAt.toISOString(),
+          })),
           gas,
           support: {
             hasAccessToken: !!account.accessToken,

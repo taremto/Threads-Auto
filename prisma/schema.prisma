@@ -34,6 +34,10 @@ model Account {
   lastSyncedAt        DateTime?                 // 最後のpullResults成功時刻
   tokenFingerprint    String?                   // GAS Properties側トークンの先頭8桁＋末尾4桁
 
+  // アカウント別分析（Threads Insights）
+  insightsEnabled     Boolean?                  // null=未判定 / true=insights権限あり / false=権限なし（縮退表示）
+  insightsLastFetchedAt DateTime?               // 最後にinsightsを取得した時刻
+
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
   posts           Post[]
@@ -53,6 +57,9 @@ model Post {
   charCount     Int      @default(0)
   status        String   @default("draft") // draft | queued | posted | error
   score         Float?
+  recommendedHour Int?     // AI生成時に算出したおすすめ投稿時間（JSTの時）
+  recommendedLabel String?  // 例: 21:00前後
+  recommendedReason String? // なぜその時間帯が合うかの短い説明
   threadsPostId String?
   postedAt      DateTime?
   postUrl       String?
@@ -68,8 +75,21 @@ model Post {
   executor      String   @default("local")
   remoteRowId   Int?     // GASシート上の行番号（参考。実検索はpostIdキーで行う）
 
+  // Threads Insights 最新値キャッシュ（一覧表示・ランキング用。履歴は PostInsight）
+  lastViews     Int?
+  lastLikes     Int?
+  lastReplies   Int?
+  lastReposts   Int?
+  lastQuotes    Int?
+  lastEr        Float?    // エンゲージメント率（%）
+  insightsFetchedAt DateTime?
+  perfLabel     String?   // "engage"（エンゲージ型）| "reach"（リーチ型）| null（対象外）
+
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+
+  media         PostMedia[]
+  insights      PostInsight[]
 
   @@index([accountId, status])
   @@index([accountId, scheduledDate])
@@ -97,4 +117,66 @@ model AppSetting {
   id    String @id @default(cuid())
   key   String @unique
   value String
+}
+
+// 投稿に添付するメディア（画像。将来 video を mediaType で吸収）
+// 公開URL化は GAS(uploadMedia) 経由で Google Drive にアップ→直リンクを publicUrl に保持
+model PostMedia {
+  id          String   @id @default(cuid())
+  postId      String
+  post        Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  mediaType   String   @default("image") // "image" | 将来 "video"
+  sortOrder   Int      @default(0)        // カルーセル内の順序（0始まり）
+  driveFileId String?                      // GAS DriveApp が返す fileId（再公開・削除用）
+  publicUrl   String                       // Threads image_url 用の公開直リンク
+  status      String   @default("ready")  // "uploading" | "ready" | "error"
+  createdAt   DateTime @default(now())
+
+  @@index([postId, sortOrder])
+}
+
+// Threads Insights の時系列スナップショット（取得のたびに1行追記）
+// Post未登録の過去投稿も threadsPostId で記録できる
+model PostInsight {
+  id            String   @id @default(cuid())
+  postId        String?
+  post          Post?    @relation(fields: [postId], references: [id], onDelete: Cascade)
+  accountId     String
+  threadsPostId String
+  views         Int      @default(0)
+  likes         Int      @default(0)
+  replies       Int      @default(0)
+  reposts       Int      @default(0)
+  quotes        Int      @default(0)
+  er            Float    @default(0)
+  fetchedAt     DateTime @default(now())
+
+  @@index([accountId, threadsPostId, fetchedAt])
+  @@index([accountId, fetchedAt])
+}
+
+// CSV履歴インポート用（既存スプシ分析ツールの過去データを隔離して保持）
+// 投稿管理タブ（draft/queued/posted/error）を過去ログで汚さないため Post とは別テーブル
+model HistoricalPost {
+  id            String   @id @default(cuid())
+  accountId     String
+  threadsPostId String?  // CSVのID列（巨大数値 → String 必須）
+  postedAt      DateTime?
+  text          String   @default("")
+  postUrl       String?
+  views         Int?
+  likes         Int?
+  replies       Int?
+  reposts       Int?
+  quotes        Int?
+  er            Float?
+  treeBody      String?  // ツリー本文
+  treeCount     Int?     // ツリー数
+  tag           String?
+  perfLabel     String?  // "engage" | "reach" | null（CSVの「ナレッジ対象」由来 or 再計算）
+  source        String   @default("csv") // "csv" | "api"
+  importedAt    DateTime @default(now())
+
+  @@unique([accountId, threadsPostId])
+  @@index([accountId, postedAt])
 }

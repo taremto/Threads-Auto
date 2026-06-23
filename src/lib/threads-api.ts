@@ -8,18 +8,11 @@
  * - 永続エラー（権限・トークン・無効リクエスト）はリトライせず即諦める
  */
 
+import { isPermanentError } from "./threads-errors";
+
 const THREADS_API_BASE = "https://graph.threads.net/v1.0";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// 永続エラー判定（リトライしても回復しないもの）
-function isPermanentError(msg: string | undefined): boolean {
-  if (!msg) return false;
-  const lower = msg.toLowerCase();
-  return /permission|expired|unauthorized|invalid(?:[_\s-]+oauth)?[_\s-]*(?:token|access|request|user|parameter)|oauth[_\s-]+access[_\s-]+token|cannot[_\s-]+parse[_\s-]+access[_\s-]+token|deactivated|forbidden|not authorized|access[_\s-]*denied/.test(
-    lower
-  );
-}
 
 export type PublishedItem = {
   index: number; // items配列内のindex

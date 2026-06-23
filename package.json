@@ -7,21 +7,23 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "seed": "npx tsx prisma/seed.ts",
+    "seed": "npx tsx prisma/ensure-default-knowledge.ts",
     "test:cloud": "bash tests/run.sh",
     "test:final": "bash tests/final-check.sh",
     "test:quality": "node --import tsx tests/quality.test.ts"
   },
   "prisma": {
-    "seed": "npx tsx prisma/seed.ts"
+    "seed": "npx tsx prisma/ensure-default-knowledge.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",
     "next": "16.2.2",
     "node-cron": "^4.2.1",
+    "node-pty": "^1.1.0",
     "prisma": "^6.19.3",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "recharts": "^2.15.4"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

@@ -8,9 +8,14 @@ goto :done
 
 :no_bash
 echo.
-echo [Git Bash not found]
-echo  This launcher needs Git for Windows. Install it from:
+echo [Git Bashが見つかりません]
+echo  Windowsでこのツールを起動するには、Git for Windowsが必要です。
+echo.
+echo  次にやること:
+echo    1. 下のURLを開いて、Git for Windowsをインストールしてください。
 echo      https://git-scm.com/download/win
+echo    2. インストールが終わったら、PCを再起動してください。
+echo    3. もう一度 start.bat をダブルクリックしてください。
 echo.
 pause
 exit /b 1
@@ -29,4 +34,3 @@ if not defined BASHEXE if exist "%ProgramW6432%\Git\bin\bash.exe" set "BASHEXE=%
 if not defined BASHEXE if exist "%ProgramFiles(x86)%\Git\bin\bash.exe" set "BASHEXE=%ProgramFiles(x86)%\Git\bin\bash.exe"
 if not defined BASHEXE if exist "%LocalAppData%\Programs\Git\bin\bash.exe" set "BASHEXE=%LocalAppData%\Programs\Git\bin\bash.exe"
 exit /b 0
-
