@@ -45,6 +45,10 @@ export async function PATCH(request: Request) {
       updateData.conceptSheet =
         typeof data.conceptSheet === "string" ? data.conceptSheet : null;
     }
+    if ("personaSheet" in data) {
+      updateData.personaSheet =
+        typeof data.personaSheet === "string" ? data.personaSheet : null;
+    }
     if (typeof data.autoGenerate === "boolean") {
       updateData.autoGenerate = data.autoGenerate;
     }

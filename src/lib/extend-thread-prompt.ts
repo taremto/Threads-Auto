@@ -7,6 +7,7 @@
  */
 export type ExtendThreadPromptInput = {
   conceptSheet: string;
+  personaSheet?: string;
   rules: string;
   structures: string;
   customKnowledges: string[];
@@ -14,15 +15,26 @@ export type ExtendThreadPromptInput = {
 };
 
 export function buildExtendThreadPrompt(input: ExtendThreadPromptInput): string {
-  const { conceptSheet, rules, structures, customKnowledges, existingItems } = input;
+  const {
+    conceptSheet,
+    personaSheet,
+    rules,
+    structures,
+    customKnowledges,
+    existingItems,
+  } = input;
 
   const parts: string[] = [
-    "あなたはSNSコンテンツの専門家です。以下のコンセプト定義・ルール・構成パターンに沿って、既存のThreadsツリー（連続投稿）に自然につながる『次の1投稿』だけを書いてください。",
+    "あなたはSNSコンテンツの専門家です。以下のアカウントコンセプト・ペルソナ設計・ルール・構成パターンに沿って、既存のThreadsツリー（連続投稿）に自然につながる『次の1投稿』だけを書いてください。",
     "",
-    "## コンセプトシート（ペルソナ・語彙・テーマ）",
+    "## アカウントコンセプト",
     conceptSheet,
     "",
   ];
+
+  if (personaSheet) {
+    parts.push("## ペルソナ設計", personaSheet, "");
+  }
 
   if (rules) {
     parts.push("## 投稿生成ルール", rules, "");
@@ -63,17 +75,28 @@ export type RewriteThreadPromptInput = ExtendThreadPromptInput & {
 // 既存ツリーを「同じテーマ・主張のまま、自然な流れの targetCount 投稿のツリーに全文リライト」する
 // プロンプト。出力は1ツリーぶんの ■1〜■{targetCount}（parsePosts が複数アイテムとして読める形）。
 export function buildRewriteThreadPrompt(input: RewriteThreadPromptInput): string {
-  const { conceptSheet, rules, structures, customKnowledges, existingItems, targetCount } =
-    input;
+  const {
+    conceptSheet,
+    personaSheet,
+    rules,
+    structures,
+    customKnowledges,
+    existingItems,
+    targetCount,
+  } = input;
   const n = Math.max(2, Math.floor(targetCount));
 
   const parts: string[] = [
-    `あなたはSNSコンテンツの専門家です。以下のコンセプト定義・ルール・構成パターンに沿って、既存のThreadsツリー（連続投稿）を、同じテーマ・主張・語り口のまま、より自然な流れの「ちょうど${n}投稿のツリー」に作り直してください。`,
+    `あなたはSNSコンテンツの専門家です。以下のアカウントコンセプト・ペルソナ設計・ルール・構成パターンに沿って、既存のThreadsツリー（連続投稿）を、同じテーマ・主張・語り口のまま、より自然な流れの「ちょうど${n}投稿のツリー」に作り直してください。`,
     "",
-    "## コンセプトシート（ペルソナ・語彙・テーマ）",
+    "## アカウントコンセプト",
     conceptSheet,
     "",
   ];
+
+  if (personaSheet) {
+    parts.push("## ペルソナ設計", personaSheet, "");
+  }
 
   if (rules) parts.push("## 投稿生成ルール", rules, "");
   if (structures) parts.push("## 投稿構成パターン集", structures, "");

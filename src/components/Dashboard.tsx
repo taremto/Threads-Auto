@@ -9,9 +9,20 @@ import AnalyticsPage from "./AnalyticsPage";
 import CompetitorAnalysisPage from "./CompetitorAnalysisPage";
 import SettingsPage from "./SettingsPage";
 import GenerateModal from "./GenerateModal";
+import GenerationFlowPage from "./GenerationFlowPage";
+import CodexFlowModal from "./CodexFlowModal";
+import KnowledgeSuggestionReview from "./KnowledgeSuggestionReview";
+import type { AppliedAiInstruction } from "./PostCard";
 
 type Tab = "draft" | "queued" | "posted" | "error";
-type Page = "posts" | "overview" | "analytics" | "competitor" | "settings";
+type Page =
+  | "posts"
+  | "overview"
+  | "analytics"
+  | "competitor"
+  | "settings"
+  | "knowledge"
+  | "generation-flow";
 
 type Post = {
   id: string;
@@ -48,7 +59,12 @@ const tabLabel: Record<Tab, string> = {
   error: "エラー",
 };
 
-type AccountLite = { id: string; name: string; cloudOffloadEnabled: boolean };
+type AccountLite = {
+  id: string;
+  name: string;
+  postingHours: string;
+  cloudOffloadEnabled: boolean;
+};
 
 export default function Dashboard() {
   const [activePage, setActivePage] = useState<Page>("posts");
@@ -59,7 +75,9 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(false);
   const [showAddAccount, setShowAddAccount] = useState(false);
   const [showGenerate, setShowGenerate] = useState(false);
+  const [showCodexFlow, setShowCodexFlow] = useState(false);
   const [accountVersion, setAccountVersion] = useState(0);
+  const [suggestionVersion, setSuggestionVersion] = useState(0);
   const [hasAccounts, setHasAccounts] = useState<boolean | null>(null);
   const postsRequestSeq = useRef(0);
 
@@ -275,12 +293,25 @@ export default function Dashboard() {
     fetchPosts();
   }
 
-  async function editPost(postId: string, body: string) {
-    await fetch("/api/posts/group-action", {
+  async function editPost(
+    postId: string,
+    body: string,
+    revisionInstructions: AppliedAiInstruction[] = []
+  ) {
+    const response = await fetch("/api/posts/group-action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ postId, action: "edit", body }),
+      body: JSON.stringify({
+        postId,
+        action: "edit",
+        body,
+        revisionInstructions,
+      }),
     });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data?.error) {
+      throw new Error(data?.error || `投稿を保存できませんでした (HTTP ${response.status})`);
+    }
     fetchPosts();
   }
 
@@ -427,6 +458,7 @@ export default function Dashboard() {
         onAccountChange={(accountId) => {
           clearPostList();
           setActiveAccountId(accountId);
+          setActiveTab("draft");
         }}
         onAddAccount={() => setShowAddAccount(true)}
         accountVersion={accountVersion}
@@ -452,7 +484,11 @@ export default function Dashboard() {
       {activePage === "competitor" && (
         <CompetitorAnalysisPage accounts={accounts} />
       )}
-      {activePage === "settings" && <SettingsPage />}
+      {activePage === "generation-flow" && (
+        <GenerationFlowPage accountId={activeAccountId} />
+      )}
+      {activePage === "settings" && <SettingsPage mode="accounts" />}
+      {activePage === "knowledge" && <SettingsPage mode="knowledge" />}
       {activePage === "posts" && (
         <main className="min-w-[640px] flex-1 overflow-y-auto">
           {/* Top bar */}
@@ -484,10 +520,18 @@ export default function Dashboard() {
               {activeTab === "draft" && (
                 <button
                   onClick={() => setShowGenerate(true)}
+                  className="px-4 py-2 rounded-lg text-sm font-medium text-gray-600 bg-gray-100 hover:bg-gray-200"
+                >
+                  通常AI生成
+                </button>
+              )}
+              {activeTab === "draft" && activeAccountId && (
+                <button
+                  onClick={() => setShowCodexFlow(true)}
                   className="px-5 py-2 rounded-lg text-sm font-medium text-white"
                   style={{ background: "var(--accent)" }}
                 >
-                  AI生成
+                  生成開始
                 </button>
               )}
             </div>
@@ -495,6 +539,12 @@ export default function Dashboard() {
 
           {/* Posts */}
           <div className="px-8 pb-8">
+            {activeTab === "draft" && activeAccountId && (
+              <KnowledgeSuggestionReview
+                accountId={activeAccountId}
+                refreshKey={suggestionVersion}
+              />
+            )}
             {activeTab === "queued" &&
               posts.length > 0 &&
               activeAccount &&
@@ -539,8 +589,8 @@ export default function Dashboard() {
                 </p>
                 {activeTab === "draft" && (
                   <p className="text-sm">
-                    「AI生成」ボタンで投稿を生成するか、Claude
-                    Codeでインポートしてください
+                    「生成開始」でCodex投稿生成フローを始めるか、
+                    「通常AI生成」で一括生成できます
                   </p>
                 )}
               </div>
@@ -566,6 +616,9 @@ export default function Dashboard() {
                   onFailedToDraft={failedToDraft}
                   onDelete={deletePost}
                   onEdit={editPost}
+                  onKnowledgeSuggestionCreated={() =>
+                    setSuggestionVersion((version) => version + 1)
+                  }
                   onExtendThread={extendThread}
                 />
               );
@@ -589,6 +642,29 @@ export default function Dashboard() {
             setShowGenerate(false);
             setActiveTab("draft");
             fetchPosts();
+          }}
+        />
+      )}
+
+      {showCodexFlow && activeAccountId && activeAccount && (
+        <CodexFlowModal
+          accountId={activeAccountId}
+          accountName={activeAccount.name}
+          postingHours={activeAccount.postingHours}
+          onClose={() => setShowCodexFlow(false)}
+          onGenerationStarted={() => {
+            setShowCodexFlow(false);
+            setActivePage("generation-flow");
+          }}
+          onReviewReady={() => {
+            setShowCodexFlow(false);
+            setActivePage("generation-flow");
+          }}
+          onQueued={() => {
+            setShowCodexFlow(false);
+            setActivePage("posts");
+            setActiveTab("queued");
+            fetchPosts({ tab: "queued" });
           }}
         />
       )}

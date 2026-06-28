@@ -15,6 +15,8 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     const { postId, instruction } = body;
+    const currentBody =
+      typeof body.currentBody === "string" ? body.currentBody.trim() : "";
 
     if (!postId || !instruction) {
       return NextResponse.json(
@@ -32,7 +34,17 @@ export async function POST(request: Request) {
       );
     }
 
-    const prompt = buildPostEditPrompt(post.body, instruction);
+    if (currentBody.length > 5000) {
+      return NextResponse.json(
+        { error: "修正対象の本文が長すぎます" },
+        { status: 400 }
+      );
+    }
+
+    const prompt = buildPostEditPrompt(
+      currentBody || post.body,
+      String(instruction).trim()
+    );
 
     let result: string;
     try {

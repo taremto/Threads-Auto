@@ -43,10 +43,22 @@ export function parsePosts(rawText: string, expectedCount = 1): ParsedPost[] {
     }
   }
 
-  return posts.filter((p) => p.items.some((i) => i.trim().length > 0));
+  return posts
+    .map((post) => {
+      const items = post.items
+        .map(removeLayerLabel)
+        .filter((item) => item.length > 0);
+      return { thread: items.length > 1, items };
+    })
+    .filter((post) => post.items.length > 0);
 }
 
 const CODE_FENCE_LINE_RE = /^[ \t　]*`{3,}[a-zA-Z0-9_-]*[ \t　]*$/;
+const LAYER_LABEL_RE = /^[ \t　]*\[L[123]\][ \t　]*(?:\r?\n)?/i;
+
+function removeLayerLabel(text: string): string {
+  return text.replace(LAYER_LABEL_RE, "").trim();
+}
 
 function normalizeOutput(text: string): string {
   let t = (text || "").trim();
