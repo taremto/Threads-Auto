@@ -50,6 +50,8 @@ type GenerateModalProps = {
   onGenerated: () => void;
 };
 
+type AiProvider = "auto" | "claude" | "codex";
+
 export default function GenerateModal({
   currentAccountId,
   onClose,
@@ -62,6 +64,7 @@ export default function GenerateModal({
   const [postCount, setPostCount] = useState(4);
   const [postCountTouched, setPostCountTouched] = useState(false);
   const [extraInstructions, setExtraInstructions] = useState("");
+  const [provider, setProvider] = useState<AiProvider>("auto");
   const [generating, setGenerating] = useState(false);
   const [checkingClaude, setCheckingClaude] = useState(true);
   const [claudeStatus, setClaudeStatus] = useState<ClaudeStatus | null>(null);
@@ -150,8 +153,9 @@ export default function GenerateModal({
     : 4;
   const usageMaxPosts = claudeUsage?.maxRecommendedPosts ?? null;
   const usageHardBlocked = usageMaxPosts === 0 || claudeUsage?.status === "blocked";
+  const claudeOnly = provider === "claude";
   const countLimit =
-    typeof usageMaxPosts === "number" && usageMaxPosts > 0
+    claudeOnly && typeof usageMaxPosts === "number" && usageMaxPosts > 0
       ? Math.min(usageMaxPosts, MAX_GENERATE_POSTS)
       : MAX_GENERATE_POSTS;
 
@@ -163,6 +167,7 @@ export default function GenerateModal({
   }, [dailyCount, selectedAccount, postCountTouched]);
 
   useEffect(() => {
+    if (!claudeOnly) return;
     if (typeof usageMaxPosts !== "number" || usageMaxPosts <= 0) return;
     if (postCount > usageMaxPosts) {
       queueMicrotask(() => {
@@ -170,11 +175,12 @@ export default function GenerateModal({
         setPostCountTouched(true);
       });
     }
-  }, [postCount, usageMaxPosts]);
+  }, [claudeOnly, postCount, usageMaxPosts]);
 
   const countOptions = buildGenerationCountOptions(dailyCount, countLimit);
 
   const usageBlockedByCount =
+    claudeOnly &&
     typeof usageMaxPosts === "number" &&
     usageMaxPosts > 0 &&
     postCount > usageMaxPosts;
@@ -235,16 +241,21 @@ export default function GenerateModal({
 
   async function handleGenerate() {
     if (!selectedAccountId) return;
-    if (checkingClaude) return;
-    if (claudeStatus && !claudeStatus.ok) {
+    if (claudeOnly && checkingClaude) return;
+    if (claudeOnly && claudeStatus && !claudeStatus.ok) {
       setError(`${claudeStatus.title}\n${claudeStatus.message}\n${claudeStatus.nextAction}`);
       return;
     }
-    if (usageHardBlocked && claudeUsage) {
+    if (claudeOnly && usageHardBlocked && claudeUsage) {
       setError(`${claudeUsage.title}\n${claudeUsage.message}\n${claudeUsage.nextAction}`);
       return;
     }
-    if (usageBlockedByCount && claudeUsage && usageMaxPosts) {
+    if (
+      claudeOnly &&
+      usageBlockedByCount &&
+      claudeUsage &&
+      usageMaxPosts
+    ) {
       setError(
         `${claudeUsage.title}\n${claudeUsage.message}\n${claudeUsage.nextAction}\n\n今回は${usageMaxPosts}投稿以下に減らしてください。`
       );
@@ -255,22 +266,40 @@ export default function GenerateModal({
     setElapsedSec(0);
     setGenerating(true);
     setError("");
+    const providerLabel =
+      provider === "codex"
+        ? "Codex"
+        : provider === "claude"
+          ? "Claude"
+          : "AI（Claude→Codex自動切替）";
     setProgress(
-      `投稿を生成中…（Opusで${generationWaitText(postCount)}かかります。このまま閉じずにお待ちください）`
+      `${providerLabel}で投稿を生成中…（${generationWaitText(postCount)}かかります。このまま閉じずにお待ちください）`
     );
 
     try {
-      const data = await postJSON<{ count: number; skippedSimilar?: number }>(
+      const data = await postJSON<{
+        count: number;
+        skippedSimilar?: number;
+        providerUsed?: "claude" | "codex";
+        fallbackFrom?: "claude";
+      }>(
         "/api/generate",
         {
           accountId: selectedAccountId,
           count: postCount,
           extraInstructions: extraInstructions.trim() || undefined,
+          provider,
         }
       );
+      const usedLabel =
+        data.providerUsed === "codex"
+          ? data.fallbackFrom === "claude"
+            ? "ClaudeからCodexへ自動切替"
+            : "Codex"
+          : "Claude";
       setDone(true);
       setProgress(
-        `${data.count}件の投稿を生成しました` +
+        `${usedLabel}で${data.count}件の投稿を生成しました` +
           (data.skippedSimilar
             ? `（過去投稿と似ていた${data.skippedSimilar}件は自動でスキップ）`
             : "")
@@ -310,6 +339,26 @@ export default function GenerateModal({
           </select>
         </div>
 
+        {/* 生成AI選択 */}
+        <div className="mb-4">
+          <label className="block text-sm font-medium text-gray-600 mb-1">
+            生成AI
+          </label>
+          <select
+            value={provider}
+            onChange={(e) => setProvider(e.target.value as AiProvider)}
+            disabled={generating}
+            className="w-full px-4 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-blue-300"
+          >
+            <option value="auto">自動切替（Claude → Codex）</option>
+            <option value="codex">Codexを使う</option>
+            <option value="claude">Claudeを使う</option>
+          </select>
+          <p className="mt-1 text-xs text-gray-500">
+            自動切替は、Claudeの利用制限・エラー時にCodexへ切り替えます。どちらも月額プランのログインを使い、APIキーは使いません。
+          </p>
+        </div>
+
         {/* コンセプト未設定の警告 */}
         {selectedAccount && !selectedAccount.conceptSheet && (
           <div className="mb-4 p-3 rounded-lg bg-yellow-50 border border-yellow-200 text-sm text-yellow-700">
@@ -317,8 +366,17 @@ export default function GenerateModal({
           </div>
         )}
 
-        {/* Claudeの安全チェック */}
-        <div
+        {provider === "codex" ? (
+          <div className="mb-4 p-3 rounded-lg border border-green-200 bg-green-50 text-sm leading-relaxed text-green-700">
+            <div className="font-bold">Codexで生成します</div>
+            <div className="mt-1">
+              ChatGPTログインを使い、読み取り専用の一時セッションで投稿文を生成します。
+            </div>
+          </div>
+        ) : (
+          <>
+          {/* Claudeの安全チェック */}
+          <div
           className={`mb-4 p-3 rounded-lg border text-sm leading-relaxed ${
             checkingClaude
               ? "bg-gray-50 border-gray-200 text-gray-600"
@@ -346,10 +404,10 @@ export default function GenerateModal({
               )}
             </>
           )}
-        </div>
+          </div>
 
-        {/* Claude使用量チェック */}
-        <div className={`mb-4 p-3 rounded-lg border text-sm leading-relaxed ${usageCardClass}`}>
+          {/* Claude使用量チェック */}
+          <div className={`mb-4 p-3 rounded-lg border text-sm leading-relaxed ${usageCardClass}`}>
           <div className="flex items-start justify-between gap-3">
             <div className="font-bold">
               {checkingUsage
@@ -415,7 +473,9 @@ export default function GenerateModal({
               )}
             </>
           )}
-        </div>
+          </div>
+          </>
+        )}
 
         {/* 投稿数指定 */}
         <div className="mb-6">
@@ -428,7 +488,7 @@ export default function GenerateModal({
               setPostCount(Number(e.target.value));
               setPostCountTouched(true);
             }}
-            disabled={generating || usageHardBlocked}
+            disabled={generating || (claudeOnly && usageHardBlocked)}
             className="w-full px-4 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-blue-300"
           >
             {countOptions.map((n) => (
@@ -437,11 +497,13 @@ export default function GenerateModal({
               </option>
             ))}
           </select>
-          {typeof usageMaxPosts === "number" && usageMaxPosts > 0 && (
+          {claudeOnly &&
+            typeof usageMaxPosts === "number" &&
+            usageMaxPosts > 0 && (
             <div className="mt-2 text-xs text-gray-500">
               Claude使用量が多いため、今回は{usageMaxPosts}投稿まで選べます。
             </div>
-          )}
+            )}
         </div>
 
         {/* 追加指示（任意） */}
@@ -524,10 +586,10 @@ export default function GenerateModal({
             onClick={handleGenerate}
             disabled={
               generating ||
-              checkingClaude ||
+              (claudeOnly && checkingClaude) ||
               !selectedAccountId ||
-              !!(claudeStatus && !claudeStatus.ok) ||
-              usageHardBlocked ||
+              !!(claudeOnly && claudeStatus && !claudeStatus.ok) ||
+              (claudeOnly && usageHardBlocked) ||
               usageBlockedByCount
             }
             className="flex-1 px-5 py-2.5 rounded-lg text-sm font-medium text-white transition-opacity hover:opacity-80 disabled:opacity-50"

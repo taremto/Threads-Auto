@@ -2,6 +2,11 @@ import { prisma } from "@/lib/prisma";
 import { publishStandalone, publishThread } from "@/lib/threads-api";
 import { NextResponse } from "next/server";
 
+const LAYER_TAG_RE = /^\[L[123]\]\s*\n?/;
+function stripLayerTag(body: string): string {
+  return body.replace(LAYER_TAG_RE, "");
+}
+
 /**
  * 投稿をThreads APIで公開する
  * POST body: { postId }
@@ -78,7 +83,7 @@ export async function POST(request: Request) {
 
     if (post.postType === "thread" && groupPosts.length > 1) {
       // スレッド投稿
-      const items = groupPosts.map((p) => p.body);
+      const items = groupPosts.map((p) => stripLayerTag(p.body));
       result = await publishThread(
         account.threadsUserId,
         account.accessToken,
@@ -89,7 +94,7 @@ export async function POST(request: Request) {
       result = await publishStandalone(
         account.threadsUserId,
         account.accessToken,
-        post.body
+        stripLayerTag(post.body)
       );
     }
 

@@ -1,18 +1,36 @@
 @import "tailwindcss";
 
 :root {
-  --sidebar-bg: #1a1a2e;
-  --sidebar-text: #ffffff;
-  --sidebar-active: #4fc3f7;
-  --sidebar-hover: #252545;
-  --main-bg: #f5f5f5;
-  --card-bg: #ffffff;
-  --text-primary: #1a1a1a;
-  --text-secondary: #666666;
-  --accent: #4fc3f7;
-  /* データ数値用の等幅スタック（OSネイティブ／ダウンロード無し） */
+  /* ===== 黒基調ダークテーマ（グラデーション強め） ===== */
+
+  /* サイドバー：漆黒→インディゴの放射グラデーション */
+  --sidebar-bg: radial-gradient(120% 90% at 0% 0%, #1b1d3a 0%, #0d0e1c 55%, #07070e 100%);
+  --sidebar-text: rgba(226, 232, 240, 0.66);
+  /* アクティブ項目：ブランドのアクセントグラデーション */
+  --sidebar-active: linear-gradient(135deg, #7c3aed 0%, #6366f1 45%, #38bdf8 100%);
+  --sidebar-hover: rgba(255, 255, 255, 0.07);
+
+  /* メイン背景：ニアブラックに、インディゴ／シアン／バイオレットの光をのせた多層グラデーション */
+  --main-bg:
+    radial-gradient(900px 620px at 10% -8%, rgba(99, 102, 241, 0.20), transparent 60%),
+    radial-gradient(820px 600px at 102% 0%, rgba(56, 189, 248, 0.14), transparent 55%),
+    radial-gradient(760px 720px at 92% 112%, rgba(168, 85, 247, 0.16), transparent 60%),
+    linear-gradient(180deg, #0b0b12 0%, #07070c 100%);
+
+  /* カード面：わずかにグラデーションのかかったダークサーフェス */
+  --card-bg: linear-gradient(160deg, #1a1a28 0%, #121220 100%);
+
+  --text-primary: #eef0f6;
+  --text-secondary: #9aa1b2;
+
+  /* アクセント：バイオレット→インディゴ→スカイの3段グラデーション（主要ボタン用） */
+  --accent: linear-gradient(135deg, #7c3aed 0%, #6366f1 48%, #38bdf8 100%);
+  --accent-solid: #6366f1;
+
   --font-num: ui-monospace, "SF Mono", "JetBrains Mono", "Roboto Mono",
     "DejaVu Sans Mono", Menlo, monospace;
+
+  color-scheme: dark;
 }
 
 /* 指標の数値を等幅・タブ揃え・スラッシュゼロで「計器」らしく見せるユーティリティ */
@@ -28,11 +46,20 @@
   --font-mono: var(--font-geist-mono);
 }
 
+/* html にも暗い背景を敷く（body が覆わない端・余白・オーバースクロール部分が
+   白く見えるのを防ぐ）。最暗部の単色をベースに、同じグラデーションを固定で重ねる。 */
+html {
+  background-color: #07070c;
+  background-image: var(--main-bg);
+  background-attachment: fixed;
+  min-height: 100%;
+}
+
 body {
-  background: var(--main-bg);
+  background-color: #07070c;
+  background-image: var(--main-bg);
+  background-attachment: fixed;
   color: var(--text-primary);
-  /* Geist（Vercel製）が next/font で読み込まれているのに Arial で上書きされていた。
-     プレミアムなタイポグラフィのため Geist を本来の主フォントに戻す。 */
   font-family: var(--font-geist-sans), "Hiragino Sans", "Hiragino Kaku Gothic ProN",
     "Helvetica Neue", Arial, sans-serif;
   margin: 0;
@@ -40,24 +67,173 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* プレミアムなカード面：ヘアライン境界＋多層ソフトシャドウ（光が当たって浮く質感） */
+/* =========================================================
+   ダークテーマ：Tailwind の明るいユーティリティを一括で反転
+   （各コンポーネントの className は触らず、ここだけで黒基調化）
+   ========================================================= */
+
+/* --- 面（背景） --- */
+.bg-white {
+  background-color: #181826 !important;
+  background-image: linear-gradient(160deg, #1a1a28 0%, #121220 100%);
+}
+.bg-gray-50 {
+  background-color: #0e0e16 !important;
+}
+.bg-gray-100 {
+  background-color: #1e1e2b !important;
+}
+.bg-gray-200 {
+  background-color: rgba(255, 255, 255, 0.09) !important;
+}
+.hover\:bg-gray-50:hover,
+.hover\:bg-gray-100:hover {
+  background-color: rgba(255, 255, 255, 0.06) !important;
+}
+
+/* --- 文字 --- */
+.text-gray-900,
+.text-gray-800 {
+  color: #f1f3f9 !important;
+}
+.text-gray-700,
+.text-gray-600 {
+  color: #cdd2de !important;
+}
+.text-gray-500 {
+  color: #9aa1b2 !important;
+}
+.text-gray-400 {
+  color: #7e8598 !important;
+}
+.text-gray-300 {
+  color: #6b7387 !important;
+}
+
+/* --- 罫線 --- */
+.border-gray-100 {
+  border-color: rgba(255, 255, 255, 0.07) !important;
+}
+.border-gray-200 {
+  border-color: rgba(255, 255, 255, 0.10) !important;
+}
+.border-gray-300 {
+  border-color: rgba(255, 255, 255, 0.14) !important;
+}
+
+/* slate / zinc / neutral / stone も gray と同様に反転
+   （※ 50〜200 の文字＝もともと明るいので触らない。800〜900 の背景＝もともと暗いので触らない） */
+.bg-slate-50, .bg-zinc-50, .bg-neutral-50, .bg-stone-50,
+.bg-slate-100, .bg-zinc-100, .bg-neutral-100, .bg-stone-100 {
+  background-color: #0e0e16 !important;
+}
+.bg-slate-200, .bg-zinc-200, .bg-neutral-200, .bg-stone-200 {
+  background-color: rgba(255, 255, 255, 0.09) !important;
+}
+.text-slate-900, .text-slate-800, .text-slate-700, .text-slate-600,
+.text-zinc-900, .text-zinc-800, .text-zinc-700, .text-zinc-600,
+.text-neutral-900, .text-neutral-800, .text-neutral-700, .text-neutral-600,
+.text-stone-900, .text-stone-800, .text-stone-700, .text-stone-600 {
+  color: #eef0f6 !important;
+}
+.text-slate-500, .text-zinc-500, .text-neutral-500, .text-stone-500 {
+  color: #9aa1b2 !important;
+}
+.text-slate-400, .text-zinc-400, .text-neutral-400, .text-stone-400 {
+  color: #7e8598 !important;
+}
+.text-slate-300, .text-zinc-300, .text-neutral-300, .text-stone-300 {
+  color: #6b7387 !important;
+}
+.border-slate-100, .border-slate-200, .border-slate-300, .border-slate-400,
+.border-zinc-100, .border-zinc-200, .border-zinc-300, .border-zinc-400,
+.border-neutral-100, .border-neutral-200, .border-neutral-300, .border-neutral-400,
+.border-stone-100, .border-stone-200, .border-stone-300, .border-stone-400 {
+  border-color: rgba(255, 255, 255, 0.12) !important;
+}
+
+/* --- 入力フォーム：暗い面＋明るい文字 --- */
+input:not([type="checkbox"]):not([type="radio"]),
+textarea,
+select {
+  background-color: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+}
+select option {
+  background-color: #181826;
+  color: #f8fafc;
+}
+select option:checked {
+  background-color: #93c5fd;
+  color: #0b1220;
+}
+input::placeholder,
+textarea::placeholder {
+  color: #6b7387;
+}
+
+/* --- セマンティックな色付きボックス：明るいパステル面→暗いティント面、
+       濃い色文字→明るい色文字（ダーク面でも読めるように） --- */
+.bg-blue-50, .bg-blue-100 { background-color: rgba(59, 130, 246, 0.14) !important; }
+.bg-sky-50, .bg-sky-100 { background-color: rgba(14, 165, 233, 0.14) !important; }
+.bg-indigo-50, .bg-indigo-100 { background-color: rgba(99, 102, 241, 0.14) !important; }
+.bg-violet-50, .bg-violet-100 { background-color: rgba(139, 92, 246, 0.15) !important; }
+.bg-purple-50, .bg-purple-100 { background-color: rgba(168, 85, 247, 0.15) !important; }
+.bg-green-50, .bg-green-100 { background-color: rgba(34, 197, 94, 0.14) !important; }
+.bg-emerald-50, .bg-emerald-100 { background-color: rgba(16, 185, 129, 0.14) !important; }
+.bg-amber-50, .bg-amber-100 { background-color: rgba(245, 158, 11, 0.14) !important; }
+.bg-yellow-50, .bg-yellow-100 { background-color: rgba(234, 179, 8, 0.14) !important; }
+.bg-orange-50, .bg-orange-100 { background-color: rgba(249, 115, 22, 0.14) !important; }
+.bg-red-50, .bg-red-100 { background-color: rgba(239, 68, 68, 0.14) !important; }
+.bg-rose-50, .bg-rose-100 { background-color: rgba(244, 63, 94, 0.14) !important; }
+
+.text-blue-900, .text-blue-800, .text-blue-700, .text-blue-600 { color: #93c5fd !important; }
+.text-sky-900, .text-sky-800, .text-sky-700, .text-sky-600 { color: #7dd3fc !important; }
+.text-indigo-900, .text-indigo-800, .text-indigo-700, .text-indigo-600 { color: #a5b4fc !important; }
+.text-violet-900, .text-violet-800, .text-violet-700, .text-violet-600 { color: #c4b5fd !important; }
+.text-purple-900, .text-purple-800, .text-purple-700, .text-purple-600 { color: #d8b4fe !important; }
+.text-green-900, .text-green-800, .text-green-700, .text-green-600 { color: #86efac !important; }
+.text-emerald-900, .text-emerald-800, .text-emerald-700, .text-emerald-600 { color: #6ee7b7 !important; }
+.text-amber-900, .text-amber-800, .text-amber-700, .text-amber-600 { color: #fcd34d !important; }
+.text-yellow-900, .text-yellow-800, .text-yellow-700, .text-yellow-600 { color: #fde047 !important; }
+.text-orange-900, .text-orange-800, .text-orange-700, .text-orange-600 { color: #fdba74 !important; }
+.text-red-900, .text-red-800, .text-red-700, .text-red-600 { color: #fca5a5 !important; }
+.text-rose-900, .text-rose-800, .text-rose-700, .text-rose-600 { color: #fda4af !important; }
+
+.border-blue-100, .border-blue-200, .border-blue-300 { border-color: rgba(59, 130, 246, 0.32) !important; }
+.border-sky-100, .border-sky-200, .border-sky-300 { border-color: rgba(14, 165, 233, 0.32) !important; }
+.border-indigo-100, .border-indigo-200, .border-indigo-300 { border-color: rgba(99, 102, 241, 0.32) !important; }
+.border-violet-100, .border-violet-200, .border-violet-300 { border-color: rgba(139, 92, 246, 0.34) !important; }
+.border-purple-100, .border-purple-200, .border-purple-300 { border-color: rgba(168, 85, 247, 0.34) !important; }
+.border-green-100, .border-green-200, .border-green-300 { border-color: rgba(34, 197, 94, 0.32) !important; }
+.border-emerald-100, .border-emerald-200, .border-emerald-300 { border-color: rgba(16, 185, 129, 0.32) !important; }
+.border-amber-100, .border-amber-200, .border-amber-300 { border-color: rgba(245, 158, 11, 0.32) !important; }
+.border-yellow-100, .border-yellow-200, .border-yellow-300 { border-color: rgba(234, 179, 8, 0.32) !important; }
+.border-orange-100, .border-orange-200, .border-orange-300 { border-color: rgba(249, 115, 22, 0.32) !important; }
+.border-red-100, .border-red-200, .border-red-300 { border-color: rgba(239, 68, 68, 0.32) !important; }
+.border-rose-100, .border-rose-200, .border-rose-300 { border-color: rgba(244, 63, 94, 0.32) !important; }
+
+/* プレミアムなカード面：ヘアライン境界＋多層シャドウ＋アクセントのグロー */
 .card-elevated {
-  background: #ffffff;
-  border: 1px solid rgba(15, 23, 42, 0.06);
+  background: var(--card-bg);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 16px;
   box-shadow:
-    0 1px 2px rgba(16, 24, 40, 0.04),
-    0 10px 28px -16px rgba(16, 24, 40, 0.14);
+    0 1px 2px rgba(0, 0, 0, 0.4),
+    0 18px 44px -22px rgba(0, 0, 0, 0.8),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 /* ホバーでわずかに浮かせる（KPIカード用のマイクロインタラクション） */
 .card-elevated.is-hoverable {
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.22s ease;
 }
 .card-elevated.is-hoverable:hover {
-  transform: translateY(-2px);
+  transform: translateY(-3px);
   box-shadow:
-    0 2px 4px rgba(16, 24, 40, 0.05),
-    0 20px 44px -20px rgba(16, 24, 40, 0.24);
+    0 2px 6px rgba(0, 0, 0, 0.5),
+    0 28px 60px -24px rgba(99, 102, 241, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 @media (prefers-reduced-motion: reduce) {
   .card-elevated.is-hoverable {
@@ -68,21 +244,79 @@ body {
   }
 }
 
+/* 主要アクションボタン（グラデーション＋やわらかいグロー）。
+   既存の inline style={{ background: "var(--accent)" }} に光と浮きを足す。 */
+button[style*="--accent"] {
+  box-shadow: 0 10px 24px -10px rgba(124, 58, 237, 0.7);
+  transition: transform 0.15s ease, box-shadow 0.2s ease, filter 0.2s ease;
+}
+button[style*="--accent"]:hover {
+  transform: translateY(-1px);
+  filter: saturate(1.1) brightness(1.05);
+  box-shadow: 0 14px 30px -10px rgba(124, 58, 237, 0.8);
+}
+button[style*="--accent"]:active {
+  transform: translateY(0);
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
-  border-radius: 4px;
-  border: 2px solid transparent;
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  border: 3px solid transparent;
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
+  background: rgba(255, 255, 255, 0.28);
   background-clip: content-box;
 }
+
+/* =========================================================
+   競合分析ページ：独自の明るい hex パレットをダークに再マップ
+   （これらの hex はこのページ専用なので他画面に影響しない）
+   ========================================================= */
+
+/* --- 明るい面 → 暗い面 --- */
+.bg-\[\#F7F8FA\] { background-color: #0e0e16 !important; }
+.bg-\[\#F4F5F7\] { background-color: #1c1c27 !important; }
+.bg-white\/95 { background-color: rgba(24, 24, 38, 0.96) !important; }
+.hover\:bg-\[\#F7F8FA\]:hover { background-color: rgba(255, 255, 255, 0.05) !important; }
+.hover\:bg-\[\#F4F5F7\]:hover { background-color: rgba(255, 255, 255, 0.06) !important; }
+.active\:bg-\[\#F1F3F6\]:active { background-color: rgba(255, 255, 255, 0.08) !important; }
+.focus\:bg-white:focus { background-color: #181826 !important; }
+/* 選択中・バッジ（インディゴ系）／情報ボックス（スカイ系） */
+.bg-\[\#EEF0FE\] { background-color: rgba(99, 102, 241, 0.18) !important; }
+.bg-\[\#E6F4FB\] { background-color: rgba(14, 165, 233, 0.14) !important; }
+/* bg-[#4F46E5]（インディゴボタン）と bg-[#0B0D12]（暗いトグル）はそのまま活かす */
+
+/* --- 濃い文字 → 明るい文字 --- */
+.text-\[\#0B0D12\] { color: #eef0f6 !important; }
+.text-\[\#5B6472\] { color: #cdd2de !important; }
+.text-\[\#8A93A2\] { color: #9aa1b2 !important; }
+.text-\[\#AEB6C2\] { color: #7e8598 !important; }
+.text-\[\#0369A1\] { color: #7dd3fc !important; }
+.text-\[\#4338CA\] { color: #a5b4fc !important; }
+.text-\[\#4F46E5\] { color: #a5b4fc !important; }
+.hover\:text-\[\#5B6472\]:hover { color: #e2e6ee !important; }
+.hover\:text-\[\#4F46E5\]:hover { color: #c4b5fd !important; }
+/* text-[#0EA5E9]（明るい青リンク）はダークでも視認できるので維持 */
+
+/* --- 明るい罫線 → 半透明の白／色付き --- */
+.border-\[\#E8EAED\] { border-color: rgba(255, 255, 255, 0.10) !important; }
+.border-\[\#EEF0F2\] { border-color: rgba(255, 255, 255, 0.08) !important; }
+.border-\[\#D6DAE0\] { border-color: rgba(255, 255, 255, 0.14) !important; }
+.hover\:border-\[\#D6DAE0\]:hover { border-color: rgba(255, 255, 255, 0.20) !important; }
+.hover\:border-\[\#8A93A2\]:hover { border-color: rgba(255, 255, 255, 0.26) !important; }
+.border-\[\#CDE9F6\] { border-color: rgba(14, 165, 233, 0.34) !important; }
+.border-\[\#DDE0FB\] { border-color: rgba(99, 102, 241, 0.34) !important; }
+.hover\:border-\[\#DDE0FB\]:hover { border-color: rgba(99, 102, 241, 0.45) !important; }
+.ring-\[\#DDE0FB\] { --tw-ring-color: rgba(99, 102, 241, 0.35) !important; }
+.ring-\[\#EEF0FE\] { --tw-ring-color: rgba(99, 102, 241, 0.30) !important; }
+/* border-[#4F46E5] / focus:border-[#4F46E5]（選択中インディゴ）はそのまま */

@@ -20,8 +20,9 @@ model Account {
   postsPerDay     Int      @default(4)              // 1日の投稿数
   scheduleJitterMinutes Int @default(15)             // 一括予約時に0〜N分だけランダムにずらす
 
-  // コンセプトシート（strategy.md相当）
-  conceptSheet    String?  // アカウント固有のペルソナ・テーマ・キーワード等
+  // アカウント設計
+  conceptSheet    String?  // 発信者・テーマ・提供価値・トーン等
+  personaSheet    String?  // 読者像・悩み・感情・反論・望む未来等
 
   // AI自動生成を有効にするか
   autoGenerate    Boolean  @default(false)
@@ -113,6 +114,22 @@ model Knowledge {
   @@index([accountId, type])
 }
 
+model KnowledgeRevisionSuggestion {
+  id                String   @id @default(cuid())
+  accountId         String
+  postId            String?
+  instruction       String
+  beforeBody        String?
+  afterBody         String?
+  status            String   @default("pending") // pending | applied | skipped
+  targetKnowledgeId String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([accountId, status, createdAt])
+  @@index([postId, status])
+}
+
 model AppSetting {
   id    String @id @default(cuid())
   key   String @unique
@@ -153,6 +170,43 @@ model PostInsight {
 
   @@index([accountId, threadsPostId, fetchedAt])
   @@index([accountId, fetchedAt])
+}
+
+// 生成フロー可視化（Claude Code対話の進行状況をWebUIで表示）
+model GenerationSession {
+  id            String   @id @default(cuid())
+  accountId     String
+  status        String   @default("running")  // running | completed | failed
+  layer         String?
+  category      String?
+  hookType      String?
+  templateName  String?
+  currentStep   Int      @default(0)
+  finalPostBody String?
+  error         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  steps         GenerationStep[]
+
+  @@index([accountId, createdAt])
+}
+
+model GenerationStep {
+  id            String   @id @default(cuid())
+  sessionId     String
+  session       GenerationSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  stepNumber    Int
+  stepLabel     String
+  status        String   @default("pending")  // pending | running | completed | skipped | failed
+  summary       String?
+  output        String?
+  knowledgeRefs String?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  createdAt     DateTime @default(now())
+
+  @@unique([sessionId, stepNumber])
+  @@index([sessionId])
 }
 
 // CSV履歴インポート用（既存スプシ分析ツールの過去データを隔離して保持）

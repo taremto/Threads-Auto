@@ -87,6 +87,7 @@ export async function POST(request: Request) {
     const targetCount = group.length + 1; // rewrite後の投稿数（n+1）
     const promptInput = {
       conceptSheet: account.conceptSheet,
+      personaSheet: account.personaSheet || "",
       rules: rulesKnowledge?.content || "",
       structures: structuresKnowledge?.content || "",
       customKnowledges: customKnowledges.map((k) => k.content),

@@ -89,7 +89,7 @@ const C = {
   cyan: "#06b6d4",
   sky: "#0ea5e9", // 閲覧 / リーチ型
   neutral: "#cbd5e1", // その他（slate-300）
-  grid: "#eef2f7", // 目盛り線（極薄）
+  grid: "rgba(148,163,184,0.16)", // 目盛り線（ダーク背景でうっすら見える）
   axis: "#94a3b8", // 軸ラベル（slate-400）
 };
 
@@ -131,10 +131,10 @@ function renderActiveSlice(props: any) {
     props;
   return (
     <g>
-      <text x={cx} y={cy - 8} textAnchor="middle" style={{ fontSize: 13, fontWeight: 700, fill: "#0f172a" }}>
+      <text x={cx} y={cy - 8} textAnchor="middle" style={{ fontSize: 13, fontWeight: 700, fill: "#eef0f6" }}>
         {payload.name}
       </text>
-      <text x={cx} y={cy + 12} textAnchor="middle" style={{ fontSize: 12, fill: "#64748b" }}>
+      <text x={cx} y={cy + 12} textAnchor="middle" style={{ fontSize: 12, fill: "#9aa1b2" }}>
         {Number(value).toLocaleString()}（{(percent * 100).toFixed(0)}%）
       </text>
       <Sector
@@ -522,7 +522,7 @@ export default function AnalyticsPage({ accountId, accounts, onAccountChange }: 
   const periodEmpty = !!data && period !== "all" && !data.degraded && data.totals.withInsights === 0;
 
   return (
-    <div className="min-w-[720px] flex-1 overflow-y-auto bg-gradient-to-b from-[#fafbfd] to-[#eaeef4]">
+    <div className="min-w-[720px] flex-1 overflow-y-auto">
       {/* ヘッダー */}
       <div className="px-8 pt-6 pb-4 flex items-center justify-between flex-wrap gap-3">
         <div className="flex items-center gap-3">
@@ -762,7 +762,16 @@ export default function AnalyticsPage({ accountId, accounts, onAccountChange }: 
                   <XAxis dataKey="date" tick={{ fontSize: 11, fill: C.axis }} axisLine={false} tickLine={false} minTickGap={28} />
                   <YAxis yAxisId="left" tick={{ fontSize: 11, fill: C.axis }} axisLine={false} tickLine={false} width={44} />
                   <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11, fill: C.axis }} axisLine={false} tickLine={false} width={36} />
-                  <Tooltip />
+                  <Tooltip
+                    contentStyle={{
+                      background: "#15151f",
+                      border: "1px solid rgba(255,255,255,0.12)",
+                      borderRadius: 10,
+                      boxShadow: "0 10px 30px -10px rgba(0,0,0,0.7)",
+                    }}
+                    labelStyle={{ color: "#eef0f6" }}
+                    itemStyle={{ color: "#cdd2de" }}
+                  />
                   <Legend iconType="circle" wrapperStyle={{ fontSize: 12 }} />
                   <Area yAxisId="left" type="monotone" dataKey="views" stroke={C.sky} strokeWidth={2.5} fill="url(#areaViews)" name="閲覧" />
                   <Line yAxisId="right" type="monotone" dataKey="er" stroke={C.indigo} strokeWidth={2.5} name="ER(%)" dot={false} />
@@ -883,14 +892,14 @@ export default function AnalyticsPage({ accountId, accounts, onAccountChange }: 
                             {p.text || "（本文なし）"}
                           </p>
                           <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
-                            <Metric icon={<EyeIcon />} value={p.views.toLocaleString()} color="#0284c7" />
+                            <Metric icon={<EyeIcon />} value={p.views.toLocaleString()} color="#38bdf8" />
                             <Metric icon={<HeartIcon />} value={p.likes.toLocaleString()} color="#f43f5e" />
                             <Metric icon={<ChatIcon />} value={p.replies.toLocaleString()} color="#8b5cf6" />
                             <span
                               className="inline-flex items-center rounded-full px-1.5 py-0.5 text-[11px] font-bold tabular-nums"
                               style={{
-                                background: highEr ? "#ecfdf5" : "#f1f5f9",
-                                color: highEr ? "#059669" : "#64748b",
+                                background: highEr ? "rgba(16,185,129,0.16)" : "rgba(255,255,255,0.08)",
+                                color: highEr ? "#6ee7b7" : "#cbd5e1",
                               }}
                             >
                               ER {p.er}%
@@ -945,13 +954,13 @@ export default function AnalyticsPage({ accountId, accounts, onAccountChange }: 
                       <div className="min-w-0 flex-1">
                         <p className="line-clamp-2 whitespace-pre-wrap text-sm text-slate-800">{p.text}</p>
                         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
-                          <Metric icon={<EyeIcon />} value={p.views.toLocaleString()} color="#0284c7" />
+                          <Metric icon={<EyeIcon />} value={p.views.toLocaleString()} color="#38bdf8" />
                           <Metric icon={<HeartIcon />} value={p.likes.toLocaleString()} color="#f43f5e" />
                           <span
                             className="inline-flex items-center rounded-full px-1.5 py-0.5 text-[11px] font-bold tabular-nums"
                             style={{
-                              background: p.er >= data.p80Er ? "#ecfdf5" : "#f1f5f9",
-                              color: p.er >= data.p80Er ? "#059669" : "#64748b",
+                              background: p.er >= data.p80Er ? "rgba(16,185,129,0.16)" : "rgba(255,255,255,0.08)",
+                              color: p.er >= data.p80Er ? "#6ee7b7" : "#cbd5e1",
                             }}
                           >
                             ER {p.er}%
@@ -1155,14 +1164,17 @@ function Metric({ icon, value, color }: { icon: React.ReactNode; value: string; 
 
 function RankBadge({ rank }: { rank: number }) {
   const top = rank <= 3;
-  const topBg = ["#6366f1", "#8b8ff5", "#b7b9fa"][rank - 1];
   return (
     <div
       className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold tabular-nums"
       style={
         top
-          ? { background: topBg, color: "#fff", boxShadow: "0 1px 3px rgba(99,102,241,0.4)" }
-          : { background: "#f1f5f9", color: "#94a3b8" }
+          ? {
+              background: "rgba(99,102,241,0.25)",
+              color: "#c7d2fe",
+              boxShadow: "inset 0 0 0 1px rgba(99,102,241,0.55)",
+            }
+          : { background: "rgba(255,255,255,0.07)", color: "#aab2c5" }
       }
     >
       {rank}
@@ -1215,8 +1227,8 @@ function LabelBadge({ label }: { label: "engage" | "reach" | null }) {
     <span
       className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold"
       style={{
-        background: isEngage ? "#eef2ff" : "#e0f2fe",
-        color: isEngage ? "#4f46e5" : "#0284c7",
+        background: isEngage ? "rgba(99,102,241,0.18)" : "rgba(14,165,233,0.16)",
+        color: isEngage ? "#a5b4fc" : "#7dd3fc",
       }}
     >
       {isEngage ? "エンゲージ型" : "リーチ型"}

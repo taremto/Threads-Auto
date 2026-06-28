@@ -2,6 +2,11 @@ import { prisma } from "@/lib/prisma";
 import { validateObservedThreadsUserId } from "@/lib/account-identity";
 import type { Post } from "@prisma/client";
 import { NextResponse } from "next/server";
+
+const LAYER_TAG_RE = /^\[L[123]\]\s*\n?/;
+function stripLayerTag(s: string): string {
+  return s.replace(LAYER_TAG_RE, "");
+}
 import {
   cancelByPostId,
   deleteMedia,
@@ -67,11 +72,19 @@ function nextSafeRetryAt(busyTimes: Date[]) {
  *   { postId, action: "delete" }
  *   { postId, action: "queue", publishAt: string }  // ISO日時
  *   { postId, action: "reschedule", publishAt: string }  // queued投稿の日時変更
- *   { postId, action: "edit", body: string }        // 単一投稿の本文のみ更新
+ *   { postId, action: "edit", body: string, revisionInstructions?: [...] }
+ *     // 単一投稿の本文更新。AI修正指示があればナレッジ反映候補も同時保存
  */
 export async function POST(request: Request) {
   try {
-    const { postId, action, status, publishAt, body } = await request.json();
+    const {
+      postId,
+      action,
+      status,
+      publishAt,
+      body,
+      revisionInstructions,
+    } = await request.json();
 
     if (!postId || !action) {
       return NextResponse.json(
@@ -94,6 +107,41 @@ export async function POST(request: Request) {
         );
       }
       const trimmed = body.trim();
+      const normalizedRevisionInstructions = Array.isArray(
+        revisionInstructions
+      )
+        ? revisionInstructions
+            .map((item: unknown) => {
+              if (!item || typeof item !== "object") return null;
+              const candidate = item as Record<string, unknown>;
+              const instruction =
+                typeof candidate.instruction === "string"
+                  ? candidate.instruction.trim().slice(0, 2_000)
+                  : "";
+              if (!instruction) return null;
+              return {
+                instruction,
+                beforeBody:
+                  typeof candidate.beforeBody === "string"
+                    ? candidate.beforeBody.slice(0, 5_000)
+                    : post.body,
+                afterBody:
+                  typeof candidate.afterBody === "string"
+                    ? candidate.afterBody.slice(0, 5_000)
+                    : trimmed,
+              };
+            })
+            .filter(
+              (
+                item
+              ): item is {
+                instruction: string;
+                beforeBody: string;
+                afterBody: string;
+              } => item !== null
+            )
+            .slice(0, 20)
+        : [];
 
       // 本文を空にして保存 → その1コマを削除（スレッドを縮める）
       if (trimmed === "") {
@@ -167,11 +215,41 @@ export async function POST(request: Request) {
           }
         }
       }
-      const updated = await prisma.post.update({
-        where: { id: postId },
-        data: { body: trimmed, charCount: trimmed.length },
+      const updated = await prisma.$transaction(async (tx) => {
+        const savedPost = await tx.post.update({
+          where: { id: postId },
+          data: { body: trimmed, charCount: trimmed.length },
+        });
+        for (const revision of normalizedRevisionInstructions) {
+          const duplicate =
+            await tx.knowledgeRevisionSuggestion.findFirst({
+              where: {
+                postId,
+                status: "pending",
+                instruction: revision.instruction,
+                afterBody: revision.afterBody,
+              },
+              select: { id: true },
+            });
+          if (duplicate) continue;
+          await tx.knowledgeRevisionSuggestion.create({
+            data: {
+              accountId: post.accountId,
+              postId,
+              instruction: revision.instruction,
+              beforeBody: revision.beforeBody,
+              afterBody: revision.afterBody,
+            },
+          });
+        }
+        return savedPost;
       });
-      return NextResponse.json({ id: updated.id, body: updated.body, charCount: updated.charCount });
+      return NextResponse.json({
+        id: updated.id,
+        body: updated.body,
+        charCount: updated.charCount,
+        knowledgeSuggestionsCreated: normalizedRevisionInstructions.length,
+      });
     }
 
     const groupPosts = await prisma.post.findMany({
@@ -354,7 +432,7 @@ export async function POST(request: Request) {
           return {
             webPostId: p.id,
             groupNo: p.groupNo,
-            text: p.body,
+            text: stripLayerTag(p.body),
             postType: p.postType === "thread" ? "thread" : ("standalone" as const),
             publishAtJst: toJstString(publishAtDate),
             memo: p.memo || undefined,
@@ -528,7 +606,7 @@ export async function POST(request: Request) {
           return {
             webPostId: p.id,
             groupNo: p.groupNo,
-            text: p.body,
+            text: stripLayerTag(p.body),
             postType: p.postType === "thread" ? "thread" : ("standalone" as const),
             publishAtJst: toJstString(retryAt),
             memo: p.memo || undefined,

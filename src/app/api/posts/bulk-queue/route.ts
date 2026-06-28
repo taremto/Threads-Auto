@@ -1,6 +1,11 @@
 import { prisma } from "@/lib/prisma";
 import { validateObservedThreadsUserId } from "@/lib/account-identity";
 import { NextResponse } from "next/server";
+
+const LAYER_TAG_RE = /^\[L[123]\]\s*\n?/;
+function stripLayerTag(s: string): string {
+  return s.replace(LAYER_TAG_RE, "");
+}
 import {
   endpointFromAccount,
   gasVersionUpgradeMessage,
@@ -232,7 +237,7 @@ export async function POST(request: Request) {
         return {
           webPostId: d.id,
           groupNo: groupNoByPostId.get(d.id) ?? null,
-          text: d.body,
+          text: stripLayerTag(d.body),
           postType:
             d.postType === "thread" ? "thread" : ("standalone" as const),
           publishAtJst: toJstString(publishAtByPostId.get(d.id)!),

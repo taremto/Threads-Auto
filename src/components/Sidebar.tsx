@@ -10,7 +10,14 @@ type Account = {
 };
 
 type Tab = "draft" | "queued" | "posted" | "error";
-type Page = "posts" | "overview" | "analytics" | "competitor" | "settings";
+type Page =
+  | "posts"
+  | "overview"
+  | "analytics"
+  | "competitor"
+  | "settings"
+  | "knowledge"
+  | "generation-flow";
 
 type SidebarProps = {
   activePage: Page;
@@ -56,7 +63,9 @@ export default function Sidebar({
     { key: "overview", label: "全体概要" },
     { key: "analytics", label: "分析" },
     { key: "competitor", label: "競合分析" },
-    { key: "settings", label: "システム設定" },
+    { key: "generation-flow", label: "生成フロー" },
+    { key: "knowledge", label: "ナレッジ" },
+    { key: "settings", label: "アカウント設定" },
   ];
 
   return (
@@ -65,13 +74,37 @@ export default function Sidebar({
       style={{ background: "var(--sidebar-bg)" }}
     >
       {/* Logo */}
-      <div className="px-5 pt-5 pb-1">
-        <h1 className="text-lg font-bold text-white tracking-tight">
-          Threads Auto
-        </h1>
-        <p className="text-xs mt-0.5" style={{ color: "var(--sidebar-text)" }}>
-          ダッシュボード
-        </p>
+      <div className="px-5 pt-6 pb-2">
+        <div className="flex items-center gap-2.5">
+          <span
+            className="grid h-8 w-8 place-items-center rounded-xl text-white text-sm font-bold shadow-lg"
+            style={{
+              background: "linear-gradient(135deg, #6366f1 0%, #38bdf8 100%)",
+              boxShadow: "0 6px 16px -6px rgba(79,124,247,0.8)",
+            }}
+          >
+            T
+          </span>
+          <div className="leading-tight">
+            <h1
+              className="text-lg font-bold tracking-tight"
+              style={{
+                background: "linear-gradient(90deg, #ffffff 0%, #b7c6ff 100%)",
+                WebkitBackgroundClip: "text",
+                backgroundClip: "text",
+                color: "transparent",
+              }}
+            >
+              Threads Auto
+            </h1>
+            <p
+              className="text-[11px] tracking-wide"
+              style={{ color: "var(--sidebar-text)" }}
+            >
+              ダッシュボード
+            </p>
+          </div>
+        </div>
       </div>
 
       {/* Menu */}

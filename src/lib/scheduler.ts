@@ -12,6 +12,11 @@
 import { PrismaClient } from "@prisma/client";
 import { publishStandalone, publishThread } from "./threads-api";
 
+const LAYER_TAG_RE = /^\[L[123]\]\s*\n?/;
+function stripLayerTag(s: string): string {
+  return s.replace(LAYER_TAG_RE, "");
+}
+
 const prisma = new PrismaClient();
 
 const MAX_RETRY = 3;
@@ -216,7 +221,7 @@ async function processGroup(
     }
   }
 
-  const items = queued.map((p) => p.body);
+  const items = queued.map((p) => stripLayerTag(p.body));
   const result =
     isThread || items.length > 1
       ? await publishThread(threadsUserId, accessToken, items, {

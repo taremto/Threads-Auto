@@ -42,11 +42,22 @@ type PostCardProps = {
   onRetryFailed: (id: string) => void | Promise<void>;
   onFailedToDraft: (id: string) => void | Promise<void>;
   onDelete: (id: string) => void;
-  onEdit: (id: string, body: string) => Promise<void>;
+  onEdit: (
+    id: string,
+    body: string,
+    revisionInstructions?: AppliedAiInstruction[]
+  ) => Promise<void>;
+  onKnowledgeSuggestionCreated?: () => void;
   onExtendThread?: (
     postId: string,
     mode: "append" | "rewrite"
   ) => Promise<{ ok: boolean; error?: string }>;
+};
+
+export type AppliedAiInstruction = {
+  instruction: string;
+  beforeBody: string;
+  afterBody: string;
 };
 
 function fileToBase64(file: File | Blob): Promise<string> {
@@ -120,6 +131,27 @@ function typeLabel(postType: string) {
     case "standalone":
     default:
       return { text: "単体", color: "#2e7d32", bg: "#e8f5e9" };
+  }
+}
+
+const LAYER_TAG_RE = /^\[L([123])\]\s*\n?/;
+
+function detectLayer(body: string): { layer: number; cleanBody: string } | null {
+  const m = body.match(LAYER_TAG_RE);
+  if (!m) return null;
+  return { layer: parseInt(m[1], 10), cleanBody: body.replace(LAYER_TAG_RE, "") };
+}
+
+function layerBadge(layer: number): { text: string; color: string; bg: string } {
+  switch (layer) {
+    case 1:
+      return { text: "L1 誘導", color: "#0277bd", bg: "#e1f5fe" };
+    case 2:
+      return { text: "L2 教育", color: "#2e7d32", bg: "#e8f5e9" };
+    case 3:
+      return { text: "L3 アフィ", color: "#e65100", bg: "#fff3e0" };
+    default:
+      return { text: `L${layer}`, color: "#616161", bg: "#f5f5f5" };
   }
 }
 
@@ -213,9 +245,13 @@ export default function PostCard({
   onFailedToDraft,
   onDelete,
   onEdit,
+  onKnowledgeSuggestionCreated,
   onExtendThread,
 }: PostCardProps) {
   const tag = typeLabel(post.postType);
+  const layerInfo = detectLayer(post.body);
+  const displayBody = layerInfo ? layerInfo.cleanBody : post.body;
+  const lBadge = layerInfo ? layerBadge(layerInfo.layer) : null;
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [datePickerMode, setDatePickerMode] = useState<"queue" | "reschedule">("queue");
   const [selectedDateTime, setSelectedDateTime] = useState(() =>
@@ -230,6 +266,9 @@ export default function PostCard({
   const [aiPreview, setAiPreview] = useState<string | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [appliedAiInstructions, setAppliedAiInstructions] = useState<
+    AppliedAiInstruction[]
+  >([]);
   const [extending, setExtending] = useState(false);
   const [showExtendMenu, setShowExtendMenu] = useState(false);
   const [revertingDraft, setRevertingDraft] = useState(false);
@@ -386,6 +425,10 @@ export default function PostCard({
 
   function startEdit() {
     setEditedBody(post.body);
+    setAiInstruction("");
+    setAiPreview(null);
+    setAiError(null);
+    setAppliedAiInstructions([]);
     setIsEditing(true);
   }
 
@@ -433,7 +476,11 @@ export default function PostCard({
     // 通常の本文編集
     setSaving(true);
     try {
-      await onEdit(post.id, trimmed);
+      await onEdit(post.id, trimmed, appliedAiInstructions);
+      if (appliedAiInstructions.length > 0) {
+        onKnowledgeSuggestionCreated?.();
+      }
+      setAppliedAiInstructions([]);
       setIsEditing(false);
     } finally {
       setSaving(false);
@@ -442,6 +489,10 @@ export default function PostCard({
 
   function cancelEdit() {
     setEditedBody(post.body);
+    setAiInstruction("");
+    setAiPreview(null);
+    setAiError(null);
+    setAppliedAiInstructions([]);
     setIsEditing(false);
   }
 
@@ -454,7 +505,11 @@ export default function PostCard({
       const res = await fetch("/api/posts/ai-edit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ postId: post.id, instruction: aiInstruction }),
+        body: JSON.stringify({
+          postId: post.id,
+          instruction: aiInstruction,
+          currentBody: editedBody,
+        }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -471,6 +526,15 @@ export default function PostCard({
 
   function applyAiPreview() {
     if (!aiPreview) return;
+    const instruction = aiInstruction.trim();
+    setAppliedAiInstructions((previous) => [
+      ...previous,
+      {
+        instruction,
+        beforeBody: editedBody,
+        afterBody: aiPreview,
+      },
+    ]);
     setEditedBody(aiPreview);
     setAiPreview(null);
     setAiInstruction("");
@@ -533,6 +597,14 @@ export default function PostCard({
           >
             {tag.text}
           </span>
+          {lBadge && (
+            <span
+              className="px-2.5 py-0.5 rounded text-xs font-bold"
+              style={{ color: lBadge.color, background: lBadge.bg }}
+            >
+              {lBadge.text}
+            </span>
+          )}
           {isError && (
             <span className="px-2.5 py-0.5 rounded text-xs font-mono font-bold text-white bg-red-600">
               エラー
@@ -563,7 +635,7 @@ export default function PostCard({
               className="px-4 py-1.5 rounded-md text-sm font-medium text-white transition-opacity hover:opacity-80"
               style={{ background: "#607d8b" }}
             >
-              編集
+              編集・AI修正
             </button>
             {canExtendThread && (
               <button
@@ -933,7 +1005,7 @@ export default function PostCard({
         </div>
       ) : (
         <div className="text-sm leading-relaxed whitespace-pre-wrap text-gray-800 mb-4">
-          {post.body}
+          {displayBody}
         </div>
       )}
 
